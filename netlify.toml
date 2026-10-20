@@ -1,0 +1,4 @@
+# 같은 GitHub 저장소를 Netlify에 연결할 때 사용하는 설정 (선택)
+[build]
+  command = "npm run build"
+  publish = "dist"
