@@ -1,6 +1,6 @@
 {
-  "name": "IDRCC 2026 DCC Scoring",
-  "short_name": "IDRCC Score",
+  "name": "IDCC 2026 DCC Scoring",
+  "short_name": "IDCC Score",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
