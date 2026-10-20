@@ -1,4 +1,4 @@
-# IDRCC 2026 · DCC Scoring System
+# IDCC 2026 · DCC Scoring System
 
 심판 채점 및 HQ 집계 웹앱 (React + Vite + Tailwind + Firebase Realtime Database)
 
