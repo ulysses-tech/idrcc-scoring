@@ -1,5 +1,5 @@
 /**
- * IDRCC 2026 · DCC Rescue Flight — Judge & HQ Scoring System (v2)
+ * IDCC 2026 · DCC Rescue Flight — Judge & HQ Scoring System (v2)
  *
  * 주요 수정 사항
  *  - [버그] JSX 오류 속성(md:size) 제거 → 빌드 오류 원인
@@ -376,7 +376,7 @@ export default function App() {
     }
     meta.content =
       "width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover";
-    document.title = "IDRCC 2026 · DCC Scoring";
+    document.title = "IDCC 2026 · DCC Scoring";
   }, []);
 
   // [수정] 로그인 후에만 구독, 언마운트 시 구독 해제, 서명 이미지는 목록에서 제외
@@ -479,7 +479,7 @@ function AppHeader({ connected, onLogout, onHome }) {
           </div>
           <div className="min-w-0">
             <div className="font-black text-lg md:text-xl leading-tight tracking-tight">
-              IDRCC 2026
+              IDCC 2026
             </div>
             <div className="text-xs md:text-sm font-semibold text-sky-600 truncate">
               DCC · Rescue Flight Scoring
@@ -1040,7 +1040,7 @@ function HQView({ records, onGoToJudge, onLock }) {
     });
     XLSX.writeFile(
       wb,
-      `IDRCC_DCC_Results_${mode === "best" ? "BestTrial" : "AllTrials"}_${localStamp()}.xlsx`
+      `IDCC_DCC_Results_${mode === "best" ? "BestTrial" : "AllTrials"}_${localStamp()}.xlsx`
     );
   };
 
@@ -1446,7 +1446,7 @@ function LoginScreen({ onLogin }) {
         <div className="mx-auto w-16 h-16 rounded-3xl bg-gradient-to-br from-sky-400 to-blue-600 text-white grid place-items-center shadow-lg shadow-sky-200 mb-5">
           <Plane size={30} />
         </div>
-        <h1 className="text-2xl font-black">IDRCC 2026</h1>
+        <h1 className="text-2xl font-black">IDCC 2026</h1>
         <p className="text-sm font-bold text-sky-600 mb-7">DCC · Rescue Flight Scoring System</p>
         <input
           type="password"
