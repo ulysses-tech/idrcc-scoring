@@ -1,5 +1,14 @@
 /**
- * IDCC 2026 · DCC Rescue Flight — Judge & HQ Scoring System (v2)
+ * IDCC 2026 · DCC Rescue Flight — Judge & HQ Scoring System (v3)
+ *
+ * v3 추가 사항
+ *  - [기능] 내장 초시계: 하단 고정 바에서 Start/Stop → 랩타임 자동 입력
+ *           · 시각(타임스탬프) 기준 측정 → 화면이 꺼지거나 다른 앱으로 전환해도 정확
+ *           · 새로고침·화면 이동 후에도 측정 계속 유지
+ *           · 실수로 멈춘 경우 Undo로 측정 재개(멈춘 동안의 시간 포함)
+ *           · 측정 중 화면 꺼짐 방지(지원 기기), 시작/정지 시 진동
+ *           · 측정 중에는 제출 불가, PC에서는 스페이스바로 Start/Stop
+ *  - [변경] 화면 표기 IDRCC → IDCC
  *
  * 주요 수정 사항
  *  - [버그] JSX 오류 속성(md:size) 제거 → 빌드 오류 원인
@@ -58,6 +67,10 @@ import {
   Users,
   Loader2,
   ArrowRight,
+  Play,
+  Square,
+  Undo2,
+  Timer,
 } from "lucide-react";
 import * as XLSX from "xlsx";
 import SignatureCanvas from "react-signature-canvas";
@@ -356,6 +369,122 @@ function useScoreForm(initial) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Stopwatch
+// ─────────────────────────────────────────────────────────────
+const SW_KEY = "idrcc_stopwatch";
+const MAX_CS = 59 * 6000 + 59 * 100 + 99; // 59:59.99
+
+/** 밀리초 → {min, sec, ms(1/100초)} (1/100초 미만은 버림) */
+function msToTimeFields(ms) {
+  const cs = Math.min(Math.floor(Math.max(0, ms) / 10), MAX_CS);
+  return { min: Math.floor(cs / 6000), sec: Math.floor((cs % 6000) / 100), ms: cs % 100 };
+}
+const formatMs = (ms) => formatTime(msToTimeFields(ms));
+
+function buzz(pattern) {
+  try {
+    if (navigator.vibrate) navigator.vibrate(pattern);
+  } catch {
+    /* vibration unsupported */
+  }
+}
+
+/**
+ * 초시계 — 시작 시각을 기준으로 계산하므로 화면 꺼짐·탭 전환·새로고침에도 정확.
+ * 상태(idle | running | stopped)는 기기에 저장되어 새로고침 후에도 이어짐.
+ */
+function useStopwatch(onStop) {
+  const [sw, setSw] = useState(() => {
+    try {
+      const s = JSON.parse(storage.get(SW_KEY) || "null");
+      if (s && (s.status === "running" || s.status === "stopped") && n(s.startAt) > 0) return s;
+    } catch {
+      /* ignore corrupt state */
+    }
+    return { status: "idle", startAt: 0, elapsed: 0 };
+  });
+  const [now, setNow] = useState(() => Date.now());
+  const onStopRef = useRef(onStop);
+  onStopRef.current = onStop;
+
+  // 상태 저장
+  useEffect(() => {
+    if (sw.status === "idle") storage.remove(SW_KEY);
+    else storage.set(SW_KEY, JSON.stringify(sw));
+  }, [sw]);
+
+  // 새로고침 직후 '정지' 상태였다면 기록 시간을 폼에 다시 채움
+  useEffect(() => {
+    if (sw.status === "stopped") onStopRef.current?.(sw.elapsed);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 측정 중: 화면 갱신 + 화면 꺼짐 방지
+  useEffect(() => {
+    if (sw.status !== "running") return undefined;
+    const id = setInterval(() => setNow(Date.now()), 31);
+    let lock = null;
+    let done = false;
+    const acquire = async () => {
+      try {
+        if (!("wakeLock" in navigator) || document.visibilityState !== "visible") return;
+        const l = await navigator.wakeLock.request("screen");
+        if (done) l.release();
+        else lock = l;
+      } catch {
+        /* wake lock unsupported or denied */
+      }
+    };
+    const onVis = () => {
+      setNow(Date.now());
+      if (document.visibilityState === "visible") acquire();
+    };
+    acquire();
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      done = true;
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", onVis);
+      try {
+        if (lock) lock.release();
+      } catch {
+        /* already released */
+      }
+    };
+  }, [sw.status]);
+
+  const elapsed = sw.status === "running" ? Math.max(0, now - sw.startAt) : sw.elapsed;
+
+  const start = () => {
+    const t = Date.now();
+    setNow(t);
+    setSw({ status: "running", startAt: t, elapsed: 0 });
+    buzz(40);
+  };
+  const stop = () => {
+    if (sw.status !== "running") return;
+    const e = Math.max(0, Date.now() - sw.startAt);
+    setSw({ status: "stopped", startAt: sw.startAt, elapsed: e });
+    onStopRef.current?.(e);
+    buzz([40, 60, 40]);
+  };
+  /** 실수로 멈춘 경우: 처음 시작 시각 기준으로 측정을 이어감 */
+  const undo = () => {
+    if (sw.status !== "stopped") return;
+    setNow(Date.now());
+    setSw({ ...sw, status: "running" });
+    buzz(40);
+  };
+  const reset = () => setSw({ status: "idle", startAt: 0, elapsed: 0 });
+  const toggle = () => {
+    if (sw.status === "idle") start();
+    else if (sw.status === "running") stop();
+  };
+
+  return { status: sw.status, elapsed, start, stop, undo, reset, toggle };
+}
+
+// ─────────────────────────────────────────────────────────────
 // App
 // ─────────────────────────────────────────────────────────────
 export default function App() {
@@ -634,10 +763,34 @@ function JudgeView({ records, connected, onGoToHQ }) {
   useEffect(() => storage.set("idrcc_judge_name", form.judgeName), [form.judgeName]);
   useEffect(() => storage.set("idrcc_category", form.category), [form.category]);
 
+  // 초시계: 정지하면 랩타임 칸에 자동 입력
+  const sw = useStopwatch((ms) => patch(msToTimeFields(ms)));
+  const swRef = useRef(sw);
+  swRef.current = sw;
+
+  // PC: 스페이스바로 Start/Stop (입력 칸·버튼·서명 패드 사용 중에는 동작 안 함)
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.code !== "Space" || e.repeat) return;
+      const t = e.target;
+      const tag = String(t?.tagName || "").toLowerCase();
+      if (["input", "textarea", "select", "button", "canvas"].includes(tag) || t?.isContentEditable)
+        return;
+      e.preventDefault();
+      swRef.current.toggle();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
   const calc = calcScores(form);
 
   const handleSubmit = async () => {
     if (!db) return alert("Database is not connected. Check the Firebase configuration.");
+    if (sw.status === "running") {
+      alert("The timer is still running.\nTap STOP before submitting.");
+      return;
+    }
     const rec = buildRecord(form);
 
     if (!rec.judgeName || !rec.participantNumber || !rec.participantName) {
@@ -694,6 +847,7 @@ function JudgeView({ records, connected, onGoToHQ }) {
         showToast(`Submitted · No. ${rec.participantNumber} · ${rec.totalScore} pts`);
       }
       sigRef.current.clear();
+      sw.reset();
       setForm((prev) => ({
         ...prev,
         ...EMPTY_SCORES,
@@ -710,7 +864,7 @@ function JudgeView({ records, connected, onGoToHQ }) {
   };
 
   return (
-    <div className="max-w-4xl mx-auto px-3 md:px-6 pt-5 md:pt-8 pb-44">
+    <div className="max-w-4xl mx-auto px-3 md:px-6 pt-5 md:pt-8 pb-56 md:pb-40">
       <Toast toast={toast} />
 
       <div className="flex items-end justify-between gap-3 mb-5">
@@ -730,7 +884,7 @@ function JudgeView({ records, connected, onGoToHQ }) {
 
       <div className="space-y-5">
         <ParticipantFields form={form} patch={patch} />
-        <ScoreFields form={form} patch={patch} />
+        <ScoreFields form={form} patch={patch} stopwatch={sw} />
         <Section step={6} title="Participant Signature" icon={<PenLine size={18} />} tone="slate"
           subtitle="Ask the participant to confirm the score and sign below.">
           <SignatureBox ref={sigRef} height={200} />
@@ -744,6 +898,7 @@ function JudgeView({ records, connected, onGoToHQ }) {
         isSubmitting={isSubmitting}
         onSubmit={handleSubmit}
         label="Finalize & Submit"
+        stopwatch={sw}
       />
     </div>
   );
@@ -799,7 +954,7 @@ function ParticipantFields({ form, patch, showJudge = true }) {
   );
 }
 
-function ScoreFields({ form, patch }) {
+function ScoreFields({ form, patch, stopwatch }) {
   const calc = calcScores(form);
   const used = landingCount(form);
   const missionPts = MISSIONS.reduce(
@@ -852,7 +1007,13 @@ function ScoreFields({ form, patch }) {
         </div>
       </Section>
 
-      <Section step={5} title="Lap Time & Result" icon={<Clock size={18} />} tone="rose">
+      <Section step={5} title="Lap Time & Result" icon={<Clock size={18} />} tone="rose"
+        subtitle={
+          stopwatch
+            ? "Use the timer in the bottom bar. The time is filled in automatically when you tap STOP — adjust here only if needed."
+            : undefined
+        }
+        right={stopwatch ? <TimerStatusChip status={stopwatch.status} /> : undefined}>
         <div className="flex flex-col md:flex-row md:items-end gap-4">
           <TimeInput form={form} patch={patch} />
           <DQToggle on={!!form.isDQ} onToggle={() => patch({ isDQ: !form.isDQ })} />
@@ -862,13 +1023,106 @@ function ScoreFields({ form, patch }) {
   );
 }
 
-function SubmitBar({ total, form, isSubmitting, onSubmit, label }) {
+function TimerStatusChip({ status }) {
+  const map = {
+    idle: ["bg-slate-100 text-slate-500 ring-slate-200", "Timer ready"],
+    running: ["bg-rose-50 text-rose-600 ring-rose-200 animate-pulse", "Timing…"],
+    stopped: ["bg-emerald-50 text-emerald-700 ring-emerald-200", "Time recorded"],
+  };
+  const [cls, text] = map[status] || map.idle;
+  return (
+    <span className={`shrink-0 px-3 py-1.5 rounded-xl ring-1 text-sm font-black flex items-center gap-1.5 ${cls}`}>
+      <Timer size={14} /> {text}
+    </span>
+  );
+}
+
+/** 하단 고정 바의 초시계 — 어느 위치로 스크롤해도 바로 누를 수 있음 */
+function StopwatchControl({ sw, recorded }) {
+  const running = sw.status === "running";
+  const stopped = sw.status === "stopped";
+  const box = running
+    ? "bg-rose-50 ring-rose-200"
+    : stopped
+    ? "bg-emerald-50 ring-emerald-200"
+    : "bg-slate-50 ring-slate-200";
+  const txt = running ? "text-rose-600" : stopped ? "text-emerald-700" : "text-slate-700";
+  const dot = running ? "bg-rose-500 animate-pulse" : stopped ? "bg-emerald-500" : "bg-slate-300";
+  const btnBase =
+    "h-14 md:h-16 rounded-2xl font-black flex items-center justify-center gap-2 transition active:scale-95";
+
+  return (
+    <div className="flex items-center gap-2 md:gap-3">
+      <div
+        className={`h-14 md:h-16 px-3 md:px-4 rounded-2xl ring-1 flex items-center gap-2.5 min-w-[9.5rem] md:min-w-[11rem] ${box}`}
+        aria-live="off"
+      >
+        <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${dot}`} />
+        <div className="leading-none">
+          <div className="text-[10px] font-black uppercase tracking-widest text-slate-400 mb-1">
+            {running ? "Timing" : stopped ? "Recorded" : "Lap time"}
+          </div>
+          <div className={`font-mono text-2xl md:text-3xl font-black tabular-nums ${txt}`}>
+            {running ? formatMs(sw.elapsed) : recorded}
+          </div>
+        </div>
+      </div>
+
+      {running && (
+        <button
+          type="button"
+          onClick={sw.stop}
+          className={`${btnBase} flex-1 md:flex-none md:w-36 px-5 bg-rose-500 hover:bg-rose-600 text-white text-lg shadow-lg shadow-rose-200`}
+        >
+          <Square size={20} fill="currentColor" /> STOP
+        </button>
+      )}
+      {sw.status === "idle" && (
+        <button
+          type="button"
+          onClick={sw.start}
+          className={`${btnBase} flex-1 md:flex-none md:w-36 px-5 bg-emerald-500 hover:bg-emerald-600 text-white text-lg shadow-lg shadow-emerald-200`}
+        >
+          <Play size={20} fill="currentColor" /> START
+        </button>
+      )}
+      {stopped && (
+        <>
+          <button
+            type="button"
+            onClick={sw.undo}
+            title="Stopped by mistake? Continue timing from the original start."
+            className={`${btnBase} flex-1 md:flex-none px-3 bg-white border-2 border-slate-200 text-slate-600 text-sm hover:border-slate-300`}
+          >
+            <Undo2 size={18} /> Undo
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              if (window.confirm("Reset the timer to 0:00.00?\n(The lap time field will keep its current value.)"))
+                sw.reset();
+            }}
+            className={`${btnBase} flex-1 md:flex-none px-3 bg-white border-2 border-slate-200 text-slate-600 text-sm hover:border-slate-300`}
+          >
+            <RotateCcw size={18} /> Reset
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+function SubmitBar({ total, form, isSubmitting, onSubmit, label, stopwatch }) {
+  const timerRunning = stopwatch?.status === "running";
+  const blocked = isSubmitting || timerRunning;
   return (
     <div
       className="fixed bottom-0 inset-x-0 z-40 bg-white/95 backdrop-blur border-t border-slate-200 shadow-[0_-10px_30px_-15px_rgba(15,23,42,0.3)]"
       style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
     >
-      <div className="max-w-4xl mx-auto px-3 md:px-6 py-3 flex items-center gap-3 md:gap-5">
+      <div className="max-w-4xl mx-auto px-3 md:px-6 py-2.5 md:py-3 flex flex-col md:flex-row md:items-center gap-2.5 md:gap-4">
+        {stopwatch && <StopwatchControl sw={stopwatch} recorded={formatTime(form)} />}
+        <div className="flex items-center gap-3 md:gap-4 flex-1 min-w-0">
         <div className="shrink-0">
           <div className="text-[11px] font-black uppercase tracking-widest text-slate-400">
             Total
@@ -878,12 +1132,14 @@ function SubmitBar({ total, form, isSubmitting, onSubmit, label }) {
             <span className="text-base text-slate-400 ml-1 font-bold">pts</span>
           </div>
         </div>
-        <div className="hidden sm:flex flex-col text-sm font-bold text-slate-500 gap-0.5">
-          <span className="flex items-center gap-1.5">
-            <Clock size={14} /> {formatTime(form)}
-          </span>
-          <span>Landings {landingCount(form)}/{MAX_LANDINGS}</span>
-        </div>
+        {!stopwatch && (
+          <div className="hidden sm:flex flex-col text-sm font-bold text-slate-500 gap-0.5">
+            <span className="flex items-center gap-1.5">
+              <Clock size={14} /> {formatTime(form)}
+            </span>
+            <span>Landings {landingCount(form)}/{MAX_LANDINGS}</span>
+          </div>
+        )}
         {form.isDQ && (
           <span className="px-2.5 py-1 rounded-lg bg-rose-100 text-rose-700 text-sm font-black">
             DQ
@@ -891,9 +1147,9 @@ function SubmitBar({ total, form, isSubmitting, onSubmit, label }) {
         )}
         <button
           onClick={onSubmit}
-          disabled={isSubmitting}
-          className={`ml-auto flex-1 sm:flex-none sm:min-w-[260px] h-14 md:h-16 rounded-2xl text-white text-lg md:text-xl font-black flex items-center justify-center gap-2 shadow-lg transition active:scale-[0.98] ${
-            isSubmitting
+          disabled={blocked}
+          className={`ml-auto flex-1 md:flex-none md:min-w-[220px] h-14 md:h-16 px-3 rounded-2xl text-white text-base sm:text-lg md:text-xl font-black flex items-center justify-center gap-2 shadow-lg transition active:scale-[0.98] ${
+            blocked
               ? "bg-slate-300 cursor-not-allowed shadow-none"
               : "bg-gradient-to-r from-blue-500 to-sky-500 hover:from-blue-600 hover:to-sky-600 shadow-sky-200"
           }`}
@@ -902,12 +1158,17 @@ function SubmitBar({ total, form, isSubmitting, onSubmit, label }) {
             <>
               <Loader2 size={22} className="animate-spin" /> Submitting…
             </>
+          ) : timerRunning ? (
+            <>
+              <Timer size={22} /> Stop timer first
+            </>
           ) : (
             <>
               <CheckCircle2 size={24} /> {label}
             </>
           )}
         </button>
+        </div>
       </div>
     </div>
   );
