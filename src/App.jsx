@@ -475,7 +475,7 @@ function useStopwatch(onStop) {
     setSw({ ...sw, status: "running" });
     buzz(40);
   };
-  const reset = () => setSw({ status: "idle", startAt: 0, elapsed: 0 });
+  const reset = () => { setSw({ status: "idle", startAt: 0, elapsed: 0 }); onStopRef.current?.(0); };
   const toggle = () => {
     if (sw.status === "idle") start();
     else if (sw.status === "running") stop();
@@ -1099,7 +1099,7 @@ function StopwatchControl({ sw, recorded }) {
           <button
             type="button"
             onClick={() => {
-              if (window.confirm("Reset the timer to 0:00.00?\n(The lap time field will keep its current value.)"))
+              if (window.confirm("Reset the timer and lap time to 0:00.00?"))
                 sw.reset();
             }}
             className={`${btnBase} flex-1 md:flex-none px-3 bg-white border-2 border-slate-200 text-slate-600 text-sm hover:border-slate-300`}
