@@ -37,7 +37,18 @@ import React, {
   useImperativeHandle,
 } from "react";
 import { initializeApp, getApps } from "firebase/app";
-import { getDatabase, ref, push, onValue, update, get } from "firebase/database";
+import {
+  getDatabase,
+  ref,
+  push,
+  onValue,
+  update,
+  get,
+  set,
+  remove,
+  onDisconnect,
+} from "firebase/database";
+import { RosterPicker, RosterManager, DEVICE_ID, claimedByOther } from "./Roster";
 import {
   LogOut,
   UserCheck,
@@ -230,7 +241,61 @@ function buildRecord(form) {
   Object.keys(EMPTY_SCORES).forEach((k) => {
     out[k] = k === "isDQ" ? !!form.isDQ : n(form[k]);
   });
+  // 명단에서 가져온 부가 정보 (있을 때만 저장)
+  PROFILE_FIELDS.forEach((k) => {
+    const v = String(form[k] ?? "").trim();
+    if (v) out[k] = v;
+  });
+  if (form.rosterId) out.rosterId = String(form.rosterId);
   return { ...out, ...calcScores(out) };
+}
+
+// ─────────────────────────────────────────────────────────────
+// 참가자 명단 저장소 (Firebase: dcc_meta/roster, dcc_meta/claims)
+// ─────────────────────────────────────────────────────────────
+const ROSTER_PATH = "dcc_meta";
+const PROFILE_FIELDS = ["country", "affiliation", "grade", "gender"];
+const WRITE_TIMEOUT_MS = 10000;
+const withTimeout = (p) =>
+  Promise.race([
+    p,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), WRITE_TIMEOUT_MS)),
+  ]);
+const str = (v) => String(v ?? "").trim();
+
+const rosterFromObject = (obj) =>
+  Object.entries(obj || {})
+    .map(([id, v]) => ({ id, ...v }))
+    .sort((a, b) => n(a.order) - n(b.order));
+
+/** 명단 전체 교체 (빈 배열이면 비우기) */
+function saveRosterEntries(entries) {
+  const obj = {};
+  entries.forEach((e, i) => {
+    obj[`p${String(i + 1).padStart(4, "0")}`] = {
+      order: n(e.order) || i + 1,
+      bib: str(e.bib),
+      name: str(e.name),
+      category: str(e.category),
+      group: str(e.group),
+      ...Object.fromEntries(PROFILE_FIELDS.map((k) => [k, str(e[k])])),
+    };
+  });
+  return withTimeout(update(ref(db, ROSTER_PATH), { roster: entries.length ? obj : null, claims: null }));
+}
+
+/** 다른 심판에게 '채점 중' 표시 — 기기 연결이 끊기면 서버가 자동으로 지움 */
+async function claimRosterEntry(rosterId, judge) {
+  const r = ref(db, `${ROSTER_PATH}/claims/${rosterId}`);
+  await withTimeout(set(r, { judge: str(judge) || "Judge", device: DEVICE_ID, at: Date.now() }));
+  onDisconnect(r).remove().catch(() => {});
+}
+
+function releaseRosterEntry(rosterId) {
+  if (!db || !rosterId) return;
+  const r = ref(db, `${ROSTER_PATH}/claims/${rosterId}`);
+  onDisconnect(r).cancel().catch(() => {});
+  remove(r).catch(() => {});
 }
 
 /** [수정] 1/100초까지 포함한 시간(센티초) */
@@ -493,8 +558,26 @@ export default function App() {
   );
   const [view, setView] = useState("landing");
   const [records, setRecords] = useState([]);
+  const [legacySigs, setLegacySigs] = useState({}); // 예전 방식(기록 안에 저장된) 서명
+  const [rosterState, setRosterState] = useState({ roster: [], claims: {}, error: null });
   const [hqAuthenticated, setHqAuthenticated] = useState(false);
   const connected = useConnection();
+
+  // 참가자 명단 · 채점 중 표시 구독
+  useEffect(() => {
+    if (!db || !isLoggedIn) return undefined;
+    return onValue(
+      ref(db, ROSTER_PATH),
+      (snap) => {
+        const v = snap.val() || {};
+        setRosterState({ roster: rosterFromObject(v.roster), claims: v.claims || {}, error: null });
+      },
+      (err) => {
+        console.error("Roster sync error:", err);
+        setRosterState({ roster: [], claims: {}, error: err?.code || "error" });
+      }
+    );
+  }, [isLoggedIn]);
 
   useEffect(() => {
     let meta = document.querySelector("meta[name=viewport]");
@@ -515,12 +598,15 @@ export default function App() {
       ref(db, "scores"),
       (snap) => {
         const data = snap.val() || {};
+        const legacy = {};
         setRecords(
           Object.entries(data).map(([id, v]) => {
             const { signature, ...rest } = v || {};
+            if (signature) legacy[id] = signature;
             return { ...rest, id, hasLegacySignature: !!signature };
           })
         );
+        setLegacySigs(legacy);
       },
       (err) => {
         console.error(err);
@@ -569,7 +655,13 @@ export default function App() {
         <Landing onJudge={() => setView("judge")} onHQ={goHQ} />
       )}
       {view === "judge" && (
-        <JudgeView records={records} connected={connected} onGoToHQ={goHQ} />
+        <JudgeView
+          records={records}
+          connected={connected}
+          onGoToHQ={goHQ}
+          roster={rosterState.roster}
+          claims={rosterState.claims}
+        />
       )}
       {view === "hq_auth" && (
         <HQAuth
@@ -583,6 +675,8 @@ export default function App() {
       {view === "hq" && hqAuthenticated && (
         <HQView
           records={records}
+          legacySigs={legacySigs}
+          rosterState={rosterState}
           onGoToJudge={() => setView("judge")}
           onLock={() => {
             setHqAuthenticated(false);
@@ -746,7 +840,7 @@ function RoleCard({ tone, icon, title, desc, cta, onClick, locked }) {
 // ─────────────────────────────────────────────────────────────
 // Judge
 // ─────────────────────────────────────────────────────────────
-function JudgeView({ records, connected, onGoToHQ }) {
+function JudgeView({ records, connected, onGoToHQ, roster = [], claims = {} }) {
   const sigRef = useRef(null);
   const [toast, showToast] = useToast();
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -768,6 +862,34 @@ function JudgeView({ records, connected, onGoToHQ }) {
   // 확인 후에는 하단 START 버튼이 깜빡여 초시계 시작을 유도. 제출하면 처음 상태로 돌아감.
   const [codingDone, setCodingDone] = useState(false);
   const [readyAck, setReadyAck] = useState(false);
+
+  // ── 참가자 명단 연동 (드론 추격전과 동일) ─────────────────────
+  const [selectedId, setSelectedId] = useState(null);
+  const [selecting, setSelecting] = useState(false);
+  const [group, setGroupState] = useState(() => storage.get("idcc_roster_group") || "");
+  const setGroup = (v) => {
+    setGroupState(v);
+    storage.set("idcc_roster_group", v);
+  };
+  const selectedEntry = roster.find((r) => r.id === selectedId) || null;
+
+  // 다른 화면으로 나가면 '채점 중' 표시 해제
+  const selectedIdRef = useRef(null);
+  selectedIdRef.current = selectedId;
+  useEffect(() => () => releaseRosterEntry(selectedIdRef.current), []);
+
+  // 선택한 참가자의 번호·이름을 직접 고치면 명단 연결을 끊음 (명단에 없는 참가자로 취급)
+  useEffect(() => {
+    if (!selectedEntry) return;
+    if (
+      String(form.participantNumber).trim() !== String(selectedEntry.bib) ||
+      String(form.participantName).trim() !== String(selectedEntry.name)
+    ) {
+      releaseRosterEntry(selectedEntry.id);
+      setSelectedId(null);
+      patch({ country: "", affiliation: "", grade: "", gender: "" });
+    }
+  }, [form.participantNumber, form.participantName, selectedEntry, patch]);
 
   // 초시계: 정지하면 랩타임 칸에 자동 입력
   const sw = useStopwatch((ms) => patch(msToTimeFields(ms)));
@@ -791,13 +913,77 @@ function JudgeView({ records, connected, onGoToHQ }) {
 
   const calc = calcScores(form);
 
+  /** 명단에서 참가자 선택 → 번호·이름·부문 자동 입력 + 다른 심판에게 '채점 중' 표시 */
+  const selectParticipant = async (entry) => {
+    if (selecting) return;
+    if (!String(form.judgeName).trim()) {
+      showToast("먼저 1번 Judge Name(심판 이름)을 입력하세요", "warn");
+      return;
+    }
+    if (sw.status === "running") {
+      showToast("초시계 측정 중에는 참가자를 바꿀 수 없습니다. STOP을 먼저 누르세요", "error");
+      return;
+    }
+    const claim = claims[entry.id];
+    if (
+      claimedByOther(claim) &&
+      !window.confirm(`${claim.judge || "다른"} 심판이 이 참가자를 채점 중입니다.\n그래도 선택할까요?`)
+    )
+      return;
+    const doneThisTrial = records.some(
+      (r) => String(r.participantNumber ?? "").trim() === String(entry.bib) && r.trial === form.trial
+    );
+    if (
+      doneThisTrial &&
+      !window.confirm(`#${entry.bib} ${entry.name} 은(는) 이미 ${form.trial} 채점이 완료된 참가자입니다.\n다시 채점할까요?`)
+    )
+      return;
+    const dirty =
+      String(form.participantNumber).trim() ||
+      String(form.participantName).trim() ||
+      calc.totalScore > 0 ||
+      timeToCs(form) > 0 ||
+      sw.status !== "idle" ||
+      (sigRef.current && !sigRef.current.isEmpty());
+    if (dirty && !window.confirm("지금 입력 중인 내용(점수·초시계·서명)이 지워집니다. 참가자를 바꿀까요?")) return;
+
+    setSelecting(true);
+    let claimed = false;
+    if (connected) {
+      try {
+        await claimRosterEntry(entry.id, form.judgeName);
+        claimed = true;
+      } catch (e) {
+        console.error("Claim failed:", e);
+      }
+    }
+    setSelecting(false);
+    if (!claimed) showToast("오프라인이라 '채점 중' 표시를 하지 못했습니다. 채점은 계속할 수 있습니다", "warn");
+    if (selectedId && selectedId !== entry.id) releaseRosterEntry(selectedId);
+
+    sw.reset();
+    sigRef.current?.clear();
+    setCodingDone(false);
+    setReadyAck(false);
+    setSelectedId(entry.id);
+    setForm((prev) => ({
+      ...prev,
+      ...EMPTY_SCORES,
+      participantNumber: String(entry.bib),
+      participantName: String(entry.name),
+      category: CATEGORIES.includes(entry.category) ? entry.category : prev.category,
+      ...Object.fromEntries(PROFILE_FIELDS.map((k) => [k, entry[k] || ""])),
+    }));
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
   const handleSubmit = async () => {
     if (!db) return alert("Database is not connected. Check the Firebase configuration.");
     if (sw.status === "running") {
       alert("The timer is still running.\nTap STOP before submitting.");
       return;
     }
-    const rec = buildRecord(form);
+    const rec = buildRecord(selectedId ? { ...form, rosterId: selectedId } : form);
 
     if (!rec.judgeName || !rec.participantNumber || !rec.participantName) {
       alert("Please fill in Judge Name, Participant No. and Participant Name.");
@@ -856,9 +1042,15 @@ function JudgeView({ records, connected, onGoToHQ }) {
       sw.reset();
       setCodingDone(false);
       setReadyAck(false);
+      if (selectedId) releaseRosterEntry(selectedId); // 채점 완료 → '채점 중' 표시 해제
+      setSelectedId(null);
       setForm((prev) => ({
         ...prev,
         ...EMPTY_SCORES,
+        country: "",
+        affiliation: "",
+        grade: "",
+        gender: "",
         participantNumber: "",
         participantName: "",
       }));
@@ -891,6 +1083,19 @@ function JudgeView({ records, connected, onGoToHQ }) {
       </div>
 
       <div className="space-y-5">
+        {roster.length > 0 && (
+          <RosterPicker
+            roster={roster}
+            claims={claims}
+            records={records}
+            trial={form.trial}
+            selectedId={selectedId}
+            group={group}
+            setGroup={setGroup}
+            onSelect={selectParticipant}
+            busy={selecting}
+          />
+        )}
         <ParticipantFields form={form} patch={patch} />
         <ScoreFields
           form={form}
@@ -1290,8 +1495,37 @@ function RecentSubmissions({ records, judgeName }) {
 // ─────────────────────────────────────────────────────────────
 // HQ
 // ─────────────────────────────────────────────────────────────
-function HQView({ records, onGoToJudge, onLock }) {
+function HQView({ records, legacySigs = {}, rosterState, onGoToJudge, onLock }) {
   const [editingId, setEditingId] = useState(null);
+  const [viewSig, setViewSig] = useState(null); // 크게 볼 서명의 기록
+
+  // 서명 이미지 구독 (HQ 화면에서만 내려받음 — 심판 기기 부담 없음)
+  const [sigMap, setSigMap] = useState({});
+  useEffect(() => {
+    if (!db) return undefined;
+    return onValue(
+      ref(db, "signatures"),
+      (snap) => setSigMap(snap.val() || {}),
+      (err) => console.error("Signature sync error:", err)
+    );
+  }, []);
+  const sigOf = (id) => sigMap[id] || legacySigs[id] || null;
+
+  /** 기록 1건 삭제 (서명 포함) */
+  const handleDelete = async (r) => {
+    if (
+      !window.confirm(
+        `#${r.participantNumber} ${r.participantName} (${r.trial}) 기록을 삭제할까요?\n서명도 함께 지워지며 되돌릴 수 없습니다.`
+      )
+    )
+      return;
+    try {
+      await withTimeout(update(ref(db), { [`scores/${r.id}`]: null, [`signatures/${r.id}`]: null }));
+      showToast("Record deleted", "warn");
+    } catch (e) {
+      alert("Delete failed.\n" + (e?.message || e));
+    }
+  };
   const [catFilter, setCatFilter] = useState("All");
   const [mode, setMode] = useState("all"); // all | best
   const [sortBy, setSortBy] = useState("rank");
@@ -1345,6 +1579,10 @@ function HQView({ records, onGoToJudge, onLock }) {
     Category: r.category,
     "No.": r.participantNumber,
     Participant: r.participantName,
+    Country: r.country || "",
+    Affiliation: r.affiliation || "",
+    Grade: r.grade || "",
+    Gender: r.gender || "",
     Trial: r.trial,
     Coding: n(r.coding),
     Takeoff: n(r.takeoff),
@@ -1361,6 +1599,7 @@ function HQView({ records, onGoToJudge, onLock }) {
     Time: formatTime(r),
     DQ: r.isDQ ? "YES" : "NO",
     Judge: r.judgeName,
+    Signature: sigOf(r.id) ? "Y" : "N",
     Submitted: r.timestamp ? new Date(r.timestamp).toLocaleString() : "",
     Edited: r.editedAt ? new Date(r.editedAt).toLocaleString() : "",
   });
@@ -1425,6 +1664,16 @@ function HQView({ records, onGoToJudge, onLock }) {
           </ActionButton>
         </div>
       </div>
+
+      <RosterManager
+        roster={rosterState?.roster || []}
+        claims={rosterState?.claims || {}}
+        records={records}
+        error={rosterState?.error}
+        onSave={saveRosterEntries}
+        onClear={() => saveRosterEntries([])}
+        showToast={showToast}
+      />
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 md:gap-4 mb-6">
         <StatCard tone="sky" label="Records" value={stats.total} />
@@ -1500,7 +1749,7 @@ function HQView({ records, onGoToJudge, onLock }) {
 
       <div className="bg-white rounded-3xl border border-slate-200 shadow-sm overflow-hidden">
         <div className="overflow-x-auto">
-          <table className="w-full min-w-[1150px] text-left border-collapse">
+          <table className="w-full min-w-[1320px] text-left border-collapse">
             <thead className="bg-slate-50 text-slate-500 text-xs uppercase tracking-wider font-black border-b border-slate-200">
               <tr>
                 <th className="p-3 text-center w-20">Rank</th>
@@ -1514,13 +1763,14 @@ function HQView({ records, onGoToJudge, onLock }) {
                 <th className="p-3 text-center bg-blue-50 text-blue-600">Total</th>
                 <th className="p-3 text-center">Time</th>
                 <th className="p-3">Judge</th>
-                <th className="p-3 text-center w-16">Edit</th>
+                <th className="p-3 text-center">Signature</th>
+                <th className="p-3 text-center w-28">Edit · Delete</th>
               </tr>
             </thead>
             <tbody>
               {visible.length === 0 && (
                 <tr>
-                  <td colSpan={12} className="p-12 text-center text-slate-400 font-semibold">
+                  <td colSpan={13} className="p-12 text-center text-slate-400 font-semibold">
                     No records yet.
                   </td>
                 </tr>
@@ -1532,7 +1782,7 @@ function HQView({ records, onGoToJudge, onLock }) {
                   <React.Fragment key={r.id}>
                     {header && (
                       <tr className="bg-gradient-to-r from-slate-50 to-white border-y border-slate-200">
-                        <td colSpan={12} className="px-4 py-2.5">
+                        <td colSpan={13} className="px-4 py-2.5">
                           <CategoryBadge category={r.category} full />
                         </td>
                       </tr>
@@ -1549,7 +1799,14 @@ function HQView({ records, onGoToJudge, onLock }) {
                         <CategoryBadge category={r.category} />
                       </td>
                       <td className="p-3 font-mono font-bold text-slate-600">{r.participantNumber}</td>
-                      <td className="p-3 font-black text-slate-800 text-base">{r.participantName}</td>
+                      <td className="p-3">
+                        <div className="font-black text-slate-800 text-base">{r.participantName}</div>
+                        {(r.affiliation || r.country) && (
+                          <div className="text-xs font-semibold text-slate-400">
+                            {[r.country, r.affiliation].filter(Boolean).join(" · ")}
+                          </div>
+                        )}
+                      </td>
                       <td className="p-3 text-center text-sm font-bold text-slate-500">{r.trial}</td>
                       <td className="p-3 text-center font-bold tabular-nums">{n(r.coding)}</td>
                       <td className="p-3">
@@ -1573,13 +1830,38 @@ function HQView({ records, onGoToJudge, onLock }) {
                         )}
                       </td>
                       <td className="p-3 text-center">
-                        <button
-                          onClick={() => setEditingId(r.id)}
-                          className="w-10 h-10 rounded-xl grid place-items-center mx-auto text-slate-400 hover:text-violet-600 hover:bg-violet-50 transition"
-                          title="Edit record"
-                        >
-                          <Pencil size={18} />
-                        </button>
+                        {sigOf(r.id) ? (
+                          <button
+                            onClick={() => setViewSig(r)}
+                            className="inline-block w-28 h-12 rounded-xl border-2 border-slate-200 bg-white hover:border-sky-400 overflow-hidden align-middle"
+                            title="서명 크게 보기"
+                            aria-label={`${r.participantName} 서명 크게 보기`}
+                          >
+                            <img src={sigOf(r.id)} alt="" className="w-full h-full object-contain" />
+                          </button>
+                        ) : (
+                          <span className="text-sm font-bold text-slate-300">없음</span>
+                        )}
+                      </td>
+                      <td className="p-3">
+                        <div className="flex justify-center gap-1.5">
+                          <button
+                            onClick={() => setEditingId(r.id)}
+                            className="w-10 h-10 rounded-xl grid place-items-center border-2 border-slate-200 text-slate-500 hover:text-violet-600 hover:border-violet-300 hover:bg-violet-50 transition"
+                            title="Edit record"
+                            aria-label="Edit record"
+                          >
+                            <Pencil size={17} />
+                          </button>
+                          <button
+                            onClick={() => handleDelete(r)}
+                            className="w-10 h-10 rounded-xl grid place-items-center border-2 border-slate-200 text-slate-500 hover:text-rose-600 hover:border-rose-300 hover:bg-rose-50 transition"
+                            title="Delete record"
+                            aria-label="Delete record"
+                          >
+                            <Trash2 size={17} />
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   </React.Fragment>
@@ -1590,6 +1872,8 @@ function HQView({ records, onGoToJudge, onLock }) {
         </div>
       </div>
 
+      {viewSig && <SignatureViewer record={viewSig} src={sigOf(viewSig.id)} onClose={() => setViewSig(null)} />}
+
       {editingRecord && (
         <EditModal
           key={editingRecord.id}
@@ -1598,6 +1882,48 @@ function HQView({ records, onGoToJudge, onLock }) {
           showToast={showToast}
         />
       )}
+    </div>
+  );
+}
+
+/** HQ: 서명 크게 보기 */
+function SignatureViewer({ record, src, onClose }) {
+  useEffect(() => {
+    const onKey = (e) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  const when = record.timestamp ? new Date(record.timestamp).toLocaleString("ko-KR") : "";
+  return (
+    <div className="fixed inset-0 z-[120] bg-slate-900/40 backdrop-blur-sm flex items-center justify-center p-4" onClick={onClose}>
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label="Signature"
+        className="w-full max-w-2xl bg-white rounded-3xl shadow-2xl overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <h3 className="text-xl font-black text-slate-800 truncate">
+              #{record.participantNumber} {record.participantName} · 서명
+            </h3>
+            <p className="text-sm font-semibold text-slate-500 tabular-nums">
+              {record.trial} · 총점 {n(record.totalScore)}점{when ? ` · 제출 ${when}` : ""}
+            </p>
+          </div>
+          <button onClick={onClose} className="w-10 h-10 shrink-0 grid place-items-center rounded-xl hover:bg-slate-100 text-slate-500" aria-label="Close">
+            <X size={22} />
+          </button>
+        </div>
+        <div className="p-6 bg-slate-50">
+          {src ? (
+            <img src={src} alt={`${record.participantName} 서명`} className="w-full max-h-[60vh] object-contain bg-white rounded-2xl border-2 border-slate-200" />
+          ) : (
+            <p className="text-center text-slate-400 font-bold py-10">서명이 없습니다.</p>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
