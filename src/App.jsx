@@ -763,6 +763,12 @@ function JudgeView({ records, connected, onGoToHQ }) {
   useEffect(() => storage.set("idrcc_judge_name", form.judgeName), [form.judgeName]);
   useEffect(() => storage.set("idrcc_category", form.category), [form.category]);
 
+  // 경기 시작 준비 알림 (드론 추격전과 동일):
+  // 2번 Coding 점수를 누르면 바로 나타나 깜빡이고, 심판이 '확인'을 눌러야 멈춤.
+  // 확인 후에는 하단 START 버튼이 깜빡여 초시계 시작을 유도. 제출하면 처음 상태로 돌아감.
+  const [codingDone, setCodingDone] = useState(false);
+  const [readyAck, setReadyAck] = useState(false);
+
   // 초시계: 정지하면 랩타임 칸에 자동 입력
   const sw = useStopwatch((ms) => patch(msToTimeFields(ms)));
   const swRef = useRef(sw);
@@ -848,6 +854,8 @@ function JudgeView({ records, connected, onGoToHQ }) {
       }
       sigRef.current.clear();
       sw.reset();
+      setCodingDone(false);
+      setReadyAck(false);
       setForm((prev) => ({
         ...prev,
         ...EMPTY_SCORES,
@@ -884,7 +892,17 @@ function JudgeView({ records, connected, onGoToHQ }) {
 
       <div className="space-y-5">
         <ParticipantFields form={form} patch={patch} />
-        <ScoreFields form={form} patch={patch} stopwatch={sw} />
+        <ScoreFields
+          form={form}
+          patch={patch}
+          stopwatch={sw}
+          onCodingChange={() => setCodingDone(true)}
+          afterCoding={
+            codingDone && (
+              <ReadyAlert acknowledged={readyAck} onAcknowledge={() => setReadyAck(true)} />
+            )
+          }
+        />
         <Section step={6} title="Participant Signature" icon={<PenLine size={18} />} tone="slate"
           subtitle="Ask the participant to confirm the score and sign below.">
           <SignatureBox ref={sigRef} height={200} />
@@ -899,6 +917,7 @@ function JudgeView({ records, connected, onGoToHQ }) {
         onSubmit={handleSubmit}
         label="Finalize & Submit"
         stopwatch={sw}
+        highlightStart={readyAck && sw.status === "idle"}
       />
     </div>
   );
@@ -954,7 +973,51 @@ function ParticipantFields({ form, patch, showJudge = true }) {
   );
 }
 
-function ScoreFields({ form, patch, stopwatch }) {
+/**
+ * 경기 시작 준비 알림 — 2번 Coding 점수를 누르면 나타나 깜빡이고,
+ * 심판이 '확인'을 눌러야 깜빡임이 멈춤 (초시계 없이 경기를 시작하는 것을 방지)
+ */
+function ReadyAlert({ acknowledged, onAcknowledge }) {
+  const boxRef = useRef(null);
+  // 나타나는 즉시 화면 안으로 스크롤 (하단 고정 바에 가리지 않도록 여백 확보)
+  useEffect(() => {
+    try {
+      boxRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    } catch {
+      /* scroll unsupported */
+    }
+  }, []);
+  return (
+    <div
+      ref={boxRef}
+      role="alert"
+      style={{ scrollMarginTop: "6rem", scrollMarginBottom: "13rem" }}
+      className={`flex flex-wrap items-center justify-between gap-3 rounded-2xl border-2 px-5 sm:px-6 py-4 transition-colors ${
+        acknowledged ? "bg-emerald-50 border-emerald-300" : "bg-red-50 border-red-400"
+      }`}
+    >
+      <p className={`text-lg font-black leading-snug ${acknowledged ? "text-emerald-800" : "text-red-600 animate-blink"}`}>
+        ※ 학생의 경기 시작 준비가 완료되었습니다. 심판은 초시계를 준비하세요!
+      </p>
+      <button
+        type="button"
+        onClick={onAcknowledge}
+        disabled={acknowledged}
+        aria-pressed={acknowledged}
+        className={`shrink-0 h-12 px-4 rounded-xl border-2 font-black flex items-center gap-2 transition active:scale-95 ${
+          acknowledged
+            ? "bg-emerald-600 border-emerald-600 text-white cursor-default"
+            : "bg-white border-red-500 text-red-600 hover:bg-red-100"
+        }`}
+      >
+        {acknowledged ? <CheckCircle2 size={20} /> : <span className="w-5 h-5 rounded-md border-2 border-red-500" />}
+        {acknowledged ? "확인 완료" : "확인"}
+      </button>
+    </div>
+  );
+}
+
+function ScoreFields({ form, patch, stopwatch, onCodingChange, afterCoding }) {
   const calc = calcScores(form);
   const used = landingCount(form);
   const missionPts = MISSIONS.reduce(
@@ -967,8 +1030,16 @@ function ScoreFields({ form, patch, stopwatch }) {
     <>
       <Section step={2} title="Coding" icon={<Code size={18} />} tone="indigo"
         right={<ScoreChip tone="indigo">{n(form.coding)} / {CODING_MAX}</ScoreChip>}>
-        <CodingInput value={form.coding} onChange={(v) => patch({ coding: v })} />
+        <CodingInput
+          value={form.coding}
+          onChange={(v) => {
+            patch({ coding: v });
+            onCodingChange?.();
+          }}
+        />
       </Section>
+
+      {afterCoding}
 
       <Section step={3} title="Flight Missions" icon={<Plane size={18} />} tone="emerald"
         subtitle={`Tap each checkpoint the drone cleared (+${MISSION_PTS} each).`}
@@ -1038,7 +1109,7 @@ function TimerStatusChip({ status }) {
 }
 
 /** 하단 고정 바의 초시계 — 어느 위치로 스크롤해도 바로 누를 수 있음 */
-function StopwatchControl({ sw, recorded }) {
+function StopwatchControl({ sw, recorded, highlightStart = false }) {
   const running = sw.status === "running";
   const stopped = sw.status === "stopped";
   const box = running
@@ -1081,7 +1152,9 @@ function StopwatchControl({ sw, recorded }) {
         <button
           type="button"
           onClick={sw.start}
-          className={`${btnBase} flex-1 md:flex-none md:w-36 px-5 bg-emerald-500 hover:bg-emerald-600 text-white text-lg shadow-lg shadow-emerald-200`}
+          className={`${btnBase} flex-1 md:flex-none md:w-36 px-5 bg-emerald-500 hover:bg-emerald-600 text-white text-lg shadow-lg shadow-emerald-200 ${
+            highlightStart ? "animate-blink ring-4 ring-red-500 ring-offset-2" : ""
+          }`}
         >
           <Play size={20} fill="currentColor" /> START
         </button>
@@ -1112,7 +1185,7 @@ function StopwatchControl({ sw, recorded }) {
   );
 }
 
-function SubmitBar({ total, form, isSubmitting, onSubmit, label, stopwatch }) {
+function SubmitBar({ total, form, isSubmitting, onSubmit, label, stopwatch, highlightStart = false }) {
   const timerRunning = stopwatch?.status === "running";
   const blocked = isSubmitting || timerRunning;
   return (
@@ -1121,7 +1194,9 @@ function SubmitBar({ total, form, isSubmitting, onSubmit, label, stopwatch }) {
       style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
     >
       <div className="max-w-4xl mx-auto px-3 md:px-6 py-2.5 md:py-3 flex flex-col md:flex-row md:items-center gap-2.5 md:gap-4">
-        {stopwatch && <StopwatchControl sw={stopwatch} recorded={formatTime(form)} />}
+        {stopwatch && (
+          <StopwatchControl sw={stopwatch} recorded={formatTime(form)} highlightStart={highlightStart} />
+        )}
         <div className="flex items-center gap-3 md:gap-4 flex-1 min-w-0">
         <div className="shrink-0">
           <div className="text-[11px] font-black uppercase tracking-widest text-slate-400">
