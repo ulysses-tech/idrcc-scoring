@@ -48,7 +48,15 @@ import {
   remove,
   onDisconnect,
 } from "firebase/database";
-import { RosterPicker, RosterManager, DEVICE_ID, claimedByOther } from "./Roster";
+import {
+  RosterPicker,
+  RosterManager,
+  DEVICE_ID,
+  claimedByOther,
+  FLIGHTS_PER_TRIAL,
+  flightOf,
+  nextFlightFor,
+} from "./Roster";
 import {
   LogOut,
   UserCheck,
@@ -130,6 +138,15 @@ const CATEGORY_STYLE = {
   General: "bg-amber-100 text-amber-800 ring-amber-200",
 };
 const TRIALS = ["1st", "2nd"];
+/** 각 시기(1st·2nd)마다 2회 비행 → 총 4회. 비행 번호(flight)가 없는 예전 기록은 1회로 취급 */
+const ATTEMPTS = TRIALS.flatMap((t) =>
+  Array.from({ length: FLIGHTS_PER_TRIAL }, (_, i) => `${t}-${i + 1}`)
+); // ["1st-1", "1st-2", "2nd-1", "2nd-2"]
+const attemptLabel = (r) => `${r?.trial || "1st"}-${flightOf(r)}`;
+const parseAttempt = (label) => {
+  const [trial, f] = String(label).split("-");
+  return { trial, flight: Number(f) || 1 };
+};
 
 const CODING_MAX = 20;
 const MISSION_PTS = 10;
@@ -237,6 +254,7 @@ function buildRecord(form) {
     participantNumber: String(form.participantNumber || "").trim(),
     participantName: String(form.participantName || "").trim(),
     trial: form.trial,
+    flight: flightOf(form),
   };
   Object.keys(EMPTY_SCORES).forEach((k) => {
     out[k] = k === "isDQ" ? !!form.isDQ : n(form[k]);
@@ -850,6 +868,7 @@ function JudgeView({ records, connected, onGoToHQ, roster = [], claims = {} }) {
     participantNumber: "",
     participantName: "",
     trial: "1st",
+    flight: 1,
     ...EMPTY_SCORES,
   }));
 
@@ -930,14 +949,16 @@ function JudgeView({ records, connected, onGoToHQ, roster = [], claims = {} }) {
       !window.confirm(`${claim.judge || "다른"} 심판이 이 참가자를 채점 중입니다.\n그래도 선택할까요?`)
     )
       return;
-    const doneThisTrial = records.some(
-      (r) => String(r.participantNumber ?? "").trim() === String(entry.bib) && r.trial === form.trial
-    );
+    // 이 시기에서 아직 하지 않은 첫 비행 (1회를 마쳤으면 2회부터)
+    const missingFlight = nextFlightFor(entry.bib, form.trial, records);
     if (
-      doneThisTrial &&
-      !window.confirm(`#${entry.bib} ${entry.name} 은(는) 이미 ${form.trial} 채점이 완료된 참가자입니다.\n다시 채점할까요?`)
+      missingFlight === null &&
+      !window.confirm(
+        `#${entry.bib} ${entry.name} 은(는) 이미 ${form.trial} ${FLIGHTS_PER_TRIAL}회 비행 채점을 모두 마쳤습니다.\n다시 채점할까요?`
+      )
     )
       return;
+    const flightToUse = missingFlight ?? flightOf(form);
     const dirty =
       String(form.participantNumber).trim() ||
       String(form.participantName).trim() ||
@@ -971,6 +992,7 @@ function JudgeView({ records, connected, onGoToHQ, roster = [], claims = {} }) {
       ...EMPTY_SCORES,
       participantNumber: String(entry.bib),
       participantName: String(entry.name),
+      flight: flightToUse,
       category: CATEGORIES.includes(entry.category) ? entry.category : prev.category,
       ...Object.fromEntries(PROFILE_FIELDS.map((k) => [k, entry[k] || ""])),
     }));
@@ -1003,12 +1025,12 @@ function JudgeView({ records, connected, onGoToHQ, roster = [], claims = {} }) {
 
     // [추가] 동일 카테고리·번호·차수 중복 경고
     const dup = records.find(
-      (r) => participantKey(r) === participantKey(rec) && r.trial === rec.trial
+      (r) => participantKey(r) === participantKey(rec) && r.trial === rec.trial && flightOf(r) === rec.flight
     );
     if (
       dup &&
       !window.confirm(
-        `A ${rec.trial} trial record already exists for No. ${rec.participantNumber} (${dup.participantName}, ${rec.category}).\n\nSubmit another record anyway?`
+        `${attemptLabel(rec)} (${rec.trial} · Flight ${rec.flight}) record already exists for No. ${rec.participantNumber} (${dup.participantName}, ${rec.category}).\n\nSubmit another record anyway?`
       )
     )
       return;
@@ -1036,24 +1058,36 @@ function JudgeView({ records, connected, onGoToHQ, roster = [], claims = {} }) {
         showToast("Saved offline — will sync when online", "warn");
       } else {
         await writing;
-        showToast(`Submitted · No. ${rec.participantNumber} · ${rec.totalScore} pts`);
       }
+      const moreFlights = rec.flight < FLIGHTS_PER_TRIAL;
+      if (!offline)
+        showToast(
+          moreFlights
+            ? `${attemptLabel(rec)} 제출 완료 · ${rec.totalScore} pts → 같은 참가자 ${rec.trial}-${rec.flight + 1} 비행 준비`
+            : `${attemptLabel(rec)} 제출 완료 · No. ${rec.participantNumber} · ${rec.totalScore} pts`
+        );
       sigRef.current.clear();
       sw.reset();
       setCodingDone(false);
       setReadyAck(false);
-      if (selectedId) releaseRosterEntry(selectedId); // 채점 완료 → '채점 중' 표시 해제
-      setSelectedId(null);
-      setForm((prev) => ({
-        ...prev,
-        ...EMPTY_SCORES,
-        country: "",
-        affiliation: "",
-        grade: "",
-        gender: "",
-        participantNumber: "",
-        participantName: "",
-      }));
+      if (moreFlights) {
+        // 같은 참가자의 다음 비행: 번호·이름·부문·명단 연결은 그대로, 점수·시간·서명만 비움
+        setForm((prev) => ({ ...prev, ...EMPTY_SCORES, flight: rec.flight + 1 }));
+      } else {
+        if (selectedId) releaseRosterEntry(selectedId); // 채점 완료 → '채점 중' 표시 해제
+        setSelectedId(null);
+        setForm((prev) => ({
+          ...prev,
+          ...EMPTY_SCORES,
+          flight: 1,
+          country: "",
+          affiliation: "",
+          grade: "",
+          gender: "",
+          participantNumber: "",
+          participantName: "",
+        }));
+      }
       window.scrollTo({ top: 0, behavior: "smooth" });
     } catch (e) {
       console.error(e);
@@ -1089,6 +1123,7 @@ function JudgeView({ records, connected, onGoToHQ, roster = [], claims = {} }) {
             claims={claims}
             records={records}
             trial={form.trial}
+            flight={flightOf(form)}
             selectedId={selectedId}
             group={group}
             setGroup={setGroup}
@@ -1154,7 +1189,7 @@ function ParticipantFields({ form, patch, showJudge = true }) {
           className={showJudge ? "md:col-span-2" : ""}
         />
       </div>
-      <div className="grid md:grid-cols-[1fr_auto] gap-4 mt-4">
+      <div className="grid gap-4 mt-4">
         <div>
           <FieldLabel>Category</FieldLabel>
           <Segmented
@@ -1165,12 +1200,12 @@ function ParticipantFields({ form, patch, showJudge = true }) {
           />
         </div>
         <div>
-          <FieldLabel>Trial</FieldLabel>
+          <FieldLabel>Trial · Flight (각 시기 {FLIGHTS_PER_TRIAL}회 비행)</FieldLabel>
           <Segmented
-            options={TRIALS}
-            value={form.trial}
-            onChange={(v) => patch({ trial: v })}
-            cols="grid-cols-2 md:w-48"
+            options={ATTEMPTS}
+            value={attemptLabel(form)}
+            onChange={(v) => patch(parseAttempt(v))}
+            cols="grid-cols-4"
           />
         </div>
       </div>
@@ -1478,7 +1513,7 @@ function RecentSubmissions({ records, judgeName }) {
             <CategoryBadge category={r.category} />
             <span className="font-mono font-bold">#{r.participantNumber}</span>
             <span className="font-semibold truncate">{r.participantName}</span>
-            <span className="text-slate-400 shrink-0">{r.trial}</span>
+            <span className="text-slate-400 shrink-0">{attemptLabel(r)}</span>
             <span className="ml-auto font-black text-blue-600 tabular-nums shrink-0">
               {r.isDQ ? "DQ" : `${n(r.totalScore)} pts`}
             </span>
@@ -1515,7 +1550,7 @@ function HQView({ records, legacySigs = {}, rosterState, onGoToJudge, onLock }) 
   const handleDelete = async (r) => {
     if (
       !window.confirm(
-        `#${r.participantNumber} ${r.participantName} (${r.trial}) 기록을 삭제할까요?\n서명도 함께 지워지며 되돌릴 수 없습니다.`
+        `#${r.participantNumber} ${r.participantName} (${attemptLabel(r)}) 기록을 삭제할까요?\n서명도 함께 지워지며 되돌릴 수 없습니다.`
       )
     )
       return;
@@ -1584,6 +1619,8 @@ function HQView({ records, legacySigs = {}, rosterState, onGoToJudge, onLock }) 
     Grade: r.grade || "",
     Gender: r.gender || "",
     Trial: r.trial,
+    Flight: flightOf(r),
+    "Trial-Flight": attemptLabel(r),
     Coding: n(r.coding),
     Takeoff: n(r.takeoff),
     "Obstacle A": n(r.obsA),
@@ -1615,7 +1652,7 @@ function HQView({ records, legacySigs = {}, rosterState, onGoToJudge, onLock }) 
     });
     XLSX.writeFile(
       wb,
-      `IDCC_DCC_Results_${mode === "best" ? "BestTrial" : "AllTrials"}_${localStamp()}.xlsx`
+      `IDCC_DCC_Results_${mode === "best" ? "BestFlight" : "AllFlights"}_${localStamp()}.xlsx`
     );
   };
 
@@ -1712,8 +1749,8 @@ function HQView({ records, legacySigs = {}, rosterState, onGoToJudge, onLock }) 
         <div className="flex flex-col md:flex-row gap-3 md:items-center">
           <div className="flex p-1 bg-slate-100 rounded-2xl w-full md:w-auto">
             {[
-              ["all", "All trials"],
-              ["best", "Best trial only"],
+              ["all", "All flights"],
+              ["best", "Best flight only"],
             ].map(([k, lbl]) => (
               <button
                 key={k}
@@ -1756,7 +1793,7 @@ function HQView({ records, legacySigs = {}, rosterState, onGoToJudge, onLock }) 
                 <th className="p-3">Category</th>
                 <th className="p-3">No.</th>
                 <th className="p-3">Participant</th>
-                <th className="p-3 text-center">Trial</th>
+                <th className="p-3 text-center">Trial-Flight</th>
                 <th className="p-3 text-center">Coding</th>
                 <th className="p-3 text-center">Missions</th>
                 <th className="p-3 text-center">Landing</th>
@@ -1807,7 +1844,7 @@ function HQView({ records, legacySigs = {}, rosterState, onGoToJudge, onLock }) 
                           </div>
                         )}
                       </td>
-                      <td className="p-3 text-center text-sm font-bold text-slate-500">{r.trial}</td>
+                      <td className="p-3 text-center text-sm font-bold text-slate-500 whitespace-nowrap">{attemptLabel(r)}</td>
                       <td className="p-3 text-center font-bold tabular-nums">{n(r.coding)}</td>
                       <td className="p-3">
                         <MissionDots record={r} />
@@ -1909,7 +1946,7 @@ function SignatureViewer({ record, src, onClose }) {
               #{record.participantNumber} {record.participantName} · 서명
             </h3>
             <p className="text-sm font-semibold text-slate-500 tabular-nums">
-              {record.trial} · 총점 {n(record.totalScore)}점{when ? ` · 제출 ${when}` : ""}
+              {attemptLabel(record)} · 총점 {n(record.totalScore)}점{when ? ` · 제출 ${when}` : ""}
             </p>
           </div>
           <button onClick={onClose} className="w-10 h-10 shrink-0 grid place-items-center rounded-xl hover:bg-slate-100 text-slate-500" aria-label="Close">
@@ -2030,7 +2067,7 @@ function EditModal({ record, onClose, showToast }) {
           <div className="min-w-0">
             <h3 className="text-xl font-black leading-tight">Edit Record</h3>
             <p className="text-sm text-slate-500 font-semibold truncate">
-              #{record.participantNumber} · {record.participantName} · {record.trial}
+              #{record.participantNumber} · {record.participantName} · {attemptLabel(record)}
             </p>
           </div>
           <button

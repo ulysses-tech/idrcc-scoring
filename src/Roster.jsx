@@ -74,21 +74,43 @@ export const profileLine = (p) =>
     .filter(Boolean)
     .join(" · ");
 
-/** 채점 기록에서 '참가번호|시기' 집합 만들기 */
-const doneKeysOf = (records) =>
-  new Set(records.map((r) => `${String(r.participantNumber ?? "").trim()}|${r.trial}`));
+/** 시기(1st·2nd)마다 비행 횟수 — 각 비행은 별도 기록으로 저장 */
+export const FLIGHTS_PER_TRIAL = 2;
+/** 기록의 비행 번호 (예전 기록처럼 없으면 1회) */
+export const flightOf = (r) => Math.min(FLIGHTS_PER_TRIAL, Math.max(1, Number(r?.flight) || 1));
 
-/** 명단 항목의 상태: done | busy | mine | wait */
-const statusOf = (entry, { doneKeys, trial, claims, selectedId }) => {
-  if (entry.id === selectedId) return "mine";
-  if (entry.bib && doneKeys.has(`${entry.bib}|${trial}`)) return "done";
-  if (claimedByOther(claims[entry.id])) return "busy";
-  return "wait";
+/** 채점 기록에서 '참가번호|시기|비행' 집합 만들기 */
+const doneKeysOf = (records) =>
+  new Set(records.map((r) => `${String(r.participantNumber ?? "").trim()}|${r.trial}|${flightOf(r)}`));
+
+/** 이 참가자가 이 시기에 마친 비행 수 */
+const flightsDone = (entry, trial, doneKeys) => {
+  if (!entry.bib) return 0;
+  let c = 0;
+  for (let f = 1; f <= FLIGHTS_PER_TRIAL; f++) if (doneKeys.has(`${entry.bib}|${trial}|${f}`)) c++;
+  return c;
 };
 
-function StatusChip({ status, claim, trial }) {
+/** 이 참가자가 이 시기에 아직 하지 않은 첫 비행 번호 (모두 마쳤으면 null) */
+export const nextFlightFor = (bib, trial, records) => {
+  const keys = doneKeysOf(records);
+  for (let f = 1; f <= FLIGHTS_PER_TRIAL; f++) if (!keys.has(`${String(bib).trim()}|${trial}|${f}`)) return f;
+  return null;
+};
+
+/** 명단 항목의 상태: done(모든 비행 완료) | busy | mine | partial(일부 완료) | wait */
+const statusOf = (entry, { doneKeys, trial, claims, selectedId }) => {
+  if (entry.id === selectedId) return "mine";
+  const done = flightsDone(entry, trial, doneKeys);
+  if (done >= FLIGHTS_PER_TRIAL) return "done";
+  if (claimedByOther(claims[entry.id])) return "busy";
+  return done > 0 ? "partial" : "wait";
+};
+
+function StatusChip({ status, claim, trial, done = 0 }) {
   const map = {
-    done: ["bg-emerald-100 text-emerald-800", `✓ ${trial} 완료`],
+    done: ["bg-emerald-100 text-emerald-800", `✓ ${trial} ${FLIGHTS_PER_TRIAL}/${FLIGHTS_PER_TRIAL}`],
+    partial: ["bg-sky-100 text-sky-800", `${trial} ${done}/${FLIGHTS_PER_TRIAL}`],
     busy: ["bg-amber-100 text-amber-900", `채점 중${claim?.judge ? ` · ${claim.judge}` : ""}`],
     mine: ["bg-sky-500 text-white", "선택됨"],
     wait: ["bg-slate-100 text-slate-600", "대기"],
@@ -100,7 +122,7 @@ function StatusChip({ status, claim, trial }) {
 // -----------------------------------------------------------------------------
 //  심판용: 다음 순서 / 명단에서 선택
 // -----------------------------------------------------------------------------
-export function RosterPicker({ roster, claims, records, trial, selectedId, group, setGroup, onSelect, busy }) {
+export function RosterPicker({ roster, claims, records, trial, flight = 1, selectedId, group, setGroup, onSelect, busy }) {
   const [showList, setShowList] = useState(false);
   const [query, setQuery] = useState("");
 
@@ -109,8 +131,10 @@ export function RosterPicker({ roster, claims, records, trial, selectedId, group
   const inGroup = group && groups.includes(group) ? roster.filter((r) => r.group === group) : roster;
   const ctx = { doneKeys, trial, claims, selectedId };
 
-  const doneCount = inGroup.filter((r) => r.bib && doneKeys.has(`${r.bib}|${trial}`)).length;
-  const next = inGroup.find((r) => statusOf(r, ctx) === "wait");
+  const doneCount = inGroup.filter((r) => flightsDone(r, trial, doneKeys) >= FLIGHTS_PER_TRIAL).length;
+  // 다음 순서: 이 시기의 비행을 아직 다 마치지 않은 첫 참가자 (중간에 끊긴 참가자 포함)
+  const next = inGroup.find((r) => ["wait", "partial"].includes(statusOf(r, ctx)));
+  const nextFlight = next ? flightsDone(next, trial, doneKeys) + 1 : 1;
   const selected = roster.find((r) => r.id === selectedId);
 
   const q = query.trim().toLowerCase();
@@ -126,7 +150,7 @@ export function RosterPicker({ roster, claims, records, trial, selectedId, group
           <Users size={20} className="text-sky-600" />
           <h3 className="text-lg font-black text-slate-800">참가자 명단</h3>
           <span className="text-sm font-bold text-slate-500 tabular-nums">
-            {trial} 완료 {doneCount} / {inGroup.length}
+            {trial} {FLIGHTS_PER_TRIAL}회 비행 완료 {doneCount} / {inGroup.length}
           </span>
         </div>
         {groups.length > 0 && (
@@ -154,7 +178,10 @@ export function RosterPicker({ roster, claims, records, trial, selectedId, group
             <UserCheck size={28} className="text-sky-500 shrink-0" />
             <div className="min-w-0 flex-1">
               <div className="text-xs font-black text-sky-600">
-                채점 중인 참가자 · 순서 {selected.order} · {trial}
+                채점 중인 참가자 · 순서 {selected.order}
+              </div>
+              <div className="mt-0.5 mb-1 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-sky-500 text-white text-sm font-black">
+                {trial} · {flight}회 비행 / {FLIGHTS_PER_TRIAL}회
               </div>
               <div className="text-2xl font-black text-slate-800 truncate">
                 <span className="tabular-nums">#{selected.bib}</span> {selected.name}
@@ -175,7 +202,7 @@ export function RosterPicker({ roster, claims, records, trial, selectedId, group
           <div className="flex flex-wrap items-center gap-4">
             <div className="min-w-0 flex-1">
               <div className="text-xs font-black text-slate-500">
-                다음 순서 · {next.order}번째{next.group ? ` · ${next.group}조` : ""} · {trial}
+                다음 순서 · {next.order}번째{next.group ? ` · ${next.group}조` : ""} · {trial} {nextFlight}회 비행
               </div>
               <div className="text-3xl font-black text-slate-800 truncate">
                 <span className="tabular-nums text-sky-600">#{next.bib}</span> {next.name}
@@ -196,7 +223,7 @@ export function RosterPicker({ roster, claims, records, trial, selectedId, group
           <p className="text-lg font-bold text-emerald-700 flex items-center gap-2">
             <CheckCircle2 size={22} />
             {inGroup.length
-              ? `이 명단의 모든 참가자가 ${trial} 채점을 마쳤거나 다른 심판이 채점 중입니다.`
+              ? `이 명단의 모든 참가자가 ${trial} ${FLIGHTS_PER_TRIAL}회 비행을 마쳤거나 다른 심판이 채점 중입니다.`
               : "명단이 비어 있습니다."}
           </p>
         )}
@@ -249,7 +276,7 @@ export function RosterPicker({ roster, claims, records, trial, selectedId, group
                           <span className="block text-xs font-semibold text-slate-500 truncate">{profileLine(r)}</span>
                         )}
                       </span>
-                      <StatusChip status={st} claim={claims[r.id]} trial={trial} />
+                      <StatusChip status={st} claim={claims[r.id]} trial={trial} done={flightsDone(r, trial, doneKeys)} />
                     </button>
                   </li>
                 );
@@ -273,8 +300,8 @@ export function RosterManager({ roster, claims, records, error, onSave, onClear,
   const [open, setOpen] = useState(false);
 
   const doneKeys = useMemo(() => doneKeysOf(records), [records]);
-  const done1 = roster.filter((r) => doneKeys.has(`${r.bib}|1st`)).length;
-  const done2 = roster.filter((r) => doneKeys.has(`${r.bib}|2nd`)).length;
+  const done1 = roster.filter((r) => flightsDone(r, "1st", doneKeys) >= FLIGHTS_PER_TRIAL).length;
+  const done2 = roster.filter((r) => flightsDone(r, "2nd", doneKeys) >= FLIGHTS_PER_TRIAL).length;
   const inProgress = roster.filter((r) => claimedByOther(claims[r.id])).length;
 
   const onFile = async (e) => {
@@ -324,7 +351,7 @@ export function RosterManager({ roster, claims, records, error, onSave, onClear,
           <h3 className="text-lg font-black text-slate-800">참가자 명단</h3>
           {roster.length > 0 ? (
             <span className="text-sm font-bold text-slate-500 tabular-nums">
-              {roster.length}명 · 1st 완료 {done1} · 2nd 완료 {done2} · 채점 중 {inProgress}
+              {roster.length}명 · 1st({FLIGHTS_PER_TRIAL}회) 완료 {done1} · 2nd({FLIGHTS_PER_TRIAL}회) 완료 {done2} · 채점 중 {inProgress}
             </span>
           ) : (
             <span className="text-sm font-semibold text-slate-400">아직 없음 — 엑셀로 불러오세요</span>
@@ -408,6 +435,7 @@ export function RosterManager({ roster, claims, records, error, onSave, onClear,
                         status={statusOf(r, { doneKeys, trial: t, claims, selectedId: null })}
                         claim={claims[r.id]}
                         trial={t}
+                        done={flightsDone(r, t, doneKeys)}
                       />
                     </td>
                   ))}
