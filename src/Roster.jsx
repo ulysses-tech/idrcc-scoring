@@ -76,6 +76,8 @@ export const profileLine = (p) =>
 
 /** 시기(1st·2nd)마다 비행 횟수 — 각 비행은 별도 기록으로 저장 */
 export const FLIGHTS_PER_TRIAL = 2;
+/** 시기 표시 이름: 1st → 1라운드, 2nd → 2라운드 */
+export const roundName = (t) => ({ "1st": "1라운드", "2nd": "2라운드" }[t] || t);
 /** 기록의 비행 번호 (예전 기록처럼 없으면 1회) */
 export const flightOf = (r) => Math.min(FLIGHTS_PER_TRIAL, Math.max(1, Number(r?.flight) || 1));
 
@@ -98,6 +100,18 @@ export const nextFlightFor = (bib, trial, records) => {
   return null;
 };
 
+/** 라운드 순서 */
+export const ROUNDS = ["1st", "2nd"];
+
+/** 참가자별 연속 진행: 이 참가자가 아직 마치지 않은 첫 라운드·비행 (모두 마쳤으면 null) */
+export const nextRoundFor = (bib, records) => {
+  for (const t of ROUNDS) {
+    const f = nextFlightFor(bib, t, records);
+    if (f !== null) return { trial: t, flight: f };
+  }
+  return null;
+};
+
 /** 명단 항목의 상태: done(모든 비행 완료) | busy | mine | partial(일부 완료) | wait */
 const statusOf = (entry, { doneKeys, trial, claims, selectedId }) => {
   if (entry.id === selectedId) return "mine";
@@ -107,22 +121,35 @@ const statusOf = (entry, { doneKeys, trial, claims, selectedId }) => {
   return done > 0 ? "partial" : "wait";
 };
 
-function StatusChip({ status, claim, trial, done = 0 }) {
+function StatusChip({ status, claim, trial, done = 0, text: override }) {
   const map = {
-    done: ["bg-emerald-100 text-emerald-800", `✓ ${trial} ${FLIGHTS_PER_TRIAL}/${FLIGHTS_PER_TRIAL}`],
-    partial: ["bg-sky-100 text-sky-800", `${trial} ${done}/${FLIGHTS_PER_TRIAL}`],
+    done: ["bg-emerald-100 text-emerald-800", `✓ ${roundName(trial)} 완료`],
+    partial: ["bg-sky-100 text-sky-800", `${roundName(trial)} ${done}/${FLIGHTS_PER_TRIAL}차`],
     busy: ["bg-amber-100 text-amber-900", `채점 중${claim?.judge ? ` · ${claim.judge}` : ""}`],
     mine: ["bg-sky-500 text-white", "선택됨"],
     wait: ["bg-slate-100 text-slate-600", "대기"],
   };
-  const [cls, text] = map[status];
+  const [cls, base] = map[status];
+  const text = override || base;
   return <span className={`shrink-0 text-xs font-black px-2.5 py-1 rounded-lg whitespace-nowrap ${cls}`}>{text}</span>;
 }
 
 // -----------------------------------------------------------------------------
 //  심판용: 다음 순서 / 명단에서 선택
 // -----------------------------------------------------------------------------
-export function RosterPicker({ roster, claims, records, trial, flight = 1, selectedId, group, setGroup, onSelect, busy }) {
+export function RosterPicker({
+  roster,
+  claims,
+  records,
+  trial,
+  flight = 1,
+  selectedId,
+  group,
+  setGroup,
+  onSelect,
+  busy,
+  continuous = false, // 참가자별 1→2라운드 연속 진행
+}) {
   const [showList, setShowList] = useState(false);
   const [query, setQuery] = useState("");
 
@@ -131,16 +158,46 @@ export function RosterPicker({ roster, claims, records, trial, flight = 1, selec
   const inGroup = group && groups.includes(group) ? roster.filter((r) => r.group === group) : roster;
   const ctx = { doneKeys, trial, claims, selectedId };
 
-  const doneCount = inGroup.filter((r) => flightsDone(r, trial, doneKeys) >= FLIGHTS_PER_TRIAL).length;
-  // 다음 순서: 이 시기의 비행을 아직 다 마치지 않은 첫 참가자 (중간에 끊긴 참가자 포함)
-  const next = inGroup.find((r) => ["wait", "partial"].includes(statusOf(r, ctx)));
-  const nextFlight = next ? flightsDone(next, trial, doneKeys) + 1 : 1;
+  // 참가자별 연속 진행이면 참가자마다 '아직 마치지 않은 첫 라운드'를 기준으로 봄
+  const trialOf = (r) =>
+    continuous ? ROUNDS.find((t) => flightsDone(r, t, doneKeys) < FLIGHTS_PER_TRIAL) || null : trial;
+  const stOf = (r) => {
+    if (r.id === selectedId) return "mine";
+    const t = trialOf(r);
+    if (t === null) return "done";
+    const st = statusOf(r, { ...ctx, trial: t });
+    return continuous && st === "wait" && t !== ROUNDS[0] ? "partial" : st;
+  };
+  const chipText = (r, st) => {
+    if (!continuous) return undefined;
+    if (st === "done") return "✓ 1·2라운드 완료";
+    if (st !== "partial") return undefined;
+    const t = trialOf(r);
+    const d = flightsDone(r, t, doneKeys);
+    return d > 0 ? `${roundName(t)} ${d}/${FLIGHTS_PER_TRIAL}차` : `${roundName(ROUNDS[ROUNDS.indexOf(t) - 1])} 완료`;
+  };
+
+  const doneCount = inGroup.filter((r) => trialOf(r) === null || (!continuous && flightsDone(r, trial, doneKeys) >= FLIGHTS_PER_TRIAL)).length;
+  // 다음 순서: 아직 다 마치지 않은 첫 참가자 (중간에 끊긴 참가자 포함)
+  const next = inGroup.find((r) => ["wait", "partial"].includes(stOf(r)));
+  const nextTrial = next ? trialOf(next) : trial;
+  const nextFlight = next ? flightsDone(next, nextTrial, doneKeys) + 1 : 1;
   const selected = roster.find((r) => r.id === selectedId);
 
   const q = query.trim().toLowerCase();
   const listed = q
     ? inGroup.filter((r) => `${r.bib} ${r.name} ${r.affiliation} ${r.country}`.toLowerCase().includes(q))
     : inGroup;
+
+  if (!roster.length)
+    return (
+      <section className="bg-white rounded-3xl border-2 border-dashed border-slate-200 px-4 md:px-6 py-4 flex items-center gap-3">
+        <Users size={22} className="text-slate-400 shrink-0" />
+        <p className="text-sm md:text-base font-bold text-slate-500">
+          등록된 참가자 명단이 없습니다. HQ에서 엑셀 명단을 불러오거나, 아래에 참가번호·이름을 직접 입력하세요.
+        </p>
+      </section>
+    );
 
   return (
     <section className="bg-white rounded-3xl border-2 border-sky-200 shadow-sm overflow-hidden">
@@ -150,9 +207,19 @@ export function RosterPicker({ roster, claims, records, trial, flight = 1, selec
           <Users size={20} className="text-sky-600" />
           <h3 className="text-lg font-black text-slate-800">참가자 명단</h3>
           <span className="text-sm font-bold text-slate-500 tabular-nums">
-            {trial} {FLIGHTS_PER_TRIAL}회 비행 완료 {doneCount} / {inGroup.length}
+            {continuous ? "1·2라운드" : roundName(trial)} 완료 {doneCount} / {inGroup.length}
           </span>
         </div>
+        <button
+          type="button"
+          onClick={() => setShowList((v) => !v)}
+          aria-expanded={showList}
+          className={`h-10 px-4 rounded-xl border-2 font-black text-sm flex items-center gap-1.5 transition ${
+            showList ? "bg-sky-500 border-sky-500 text-white" : "bg-white border-sky-300 text-sky-700 hover:bg-sky-100"
+          }`}
+        >
+          <ListOrdered size={16} /> {showList ? "명단 닫기" : `전체 명단 보기 (${inGroup.length}명)`}
+        </button>
         {groups.length > 0 && (
           <label className="flex items-center gap-2 text-xs font-black text-slate-500">
             조 · 코스
@@ -181,7 +248,7 @@ export function RosterPicker({ roster, claims, records, trial, flight = 1, selec
                 채점 중인 참가자 · 순서 {selected.order}
               </div>
               <div className="mt-0.5 mb-1 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-sky-500 text-white text-sm font-black">
-                {trial} · {flight}회 비행 / {FLIGHTS_PER_TRIAL}회
+                {roundName(trial)} · {flight}차 비행 차례
               </div>
               <div className="text-2xl font-black text-slate-800 truncate">
                 <span className="tabular-nums">#{selected.bib}</span> {selected.name}
@@ -202,7 +269,8 @@ export function RosterPicker({ roster, claims, records, trial, flight = 1, selec
           <div className="flex flex-wrap items-center gap-4">
             <div className="min-w-0 flex-1">
               <div className="text-xs font-black text-slate-500">
-                다음 순서 · {next.order}번째{next.group ? ` · ${next.group}조` : ""} · {trial} {nextFlight}회 비행
+                다음 순서 · {next.order}번째{next.group ? ` · ${next.group}조` : ""} · {roundName(nextTrial)}
+                {nextFlight > 1 ? ` · ${nextFlight}차 비행부터 이어서` : ""}
               </div>
               <div className="text-3xl font-black text-slate-800 truncate">
                 <span className="tabular-nums text-sky-600">#{next.bib}</span> {next.name}
@@ -223,7 +291,7 @@ export function RosterPicker({ roster, claims, records, trial, flight = 1, selec
           <p className="text-lg font-bold text-emerald-700 flex items-center gap-2">
             <CheckCircle2 size={22} />
             {inGroup.length
-              ? `이 명단의 모든 참가자가 ${trial} ${FLIGHTS_PER_TRIAL}회 비행을 마쳤거나 다른 심판이 채점 중입니다.`
+              ? `이 명단의 모든 참가자가 ${continuous ? "1·2라운드" : roundName(trial)}를 마쳤거나 다른 심판이 채점 중입니다.`
               : "명단이 비어 있습니다."}
           </p>
         )}
@@ -231,9 +299,9 @@ export function RosterPicker({ roster, claims, records, trial, flight = 1, selec
         <button
           type="button"
           onClick={() => setShowList((v) => !v)}
-          className="mt-4 h-10 px-3 -ml-3 rounded-xl inline-flex items-center gap-1.5 text-sm font-bold text-sky-600 hover:bg-sky-50"
+          className="mt-4 h-11 px-4 rounded-xl border-2 border-slate-200 inline-flex items-center gap-1.5 text-sm font-bold text-slate-600 hover:border-sky-300 hover:text-sky-700"
         >
-          <ListOrdered size={16} /> {showList ? "명단 닫기" : "명단에서 직접 찾기 (번호·이름)"}
+          <ListOrdered size={16} /> {showList ? "명단 닫기" : "전체 명단 보기 · 번호·이름으로 찾기"}
         </button>
 
         {showList && (
@@ -253,7 +321,7 @@ export function RosterPicker({ roster, claims, records, trial, flight = 1, selec
             <ul className="mt-2 max-h-80 overflow-y-auto divide-y divide-slate-100 border border-slate-200 rounded-2xl">
               {listed.length === 0 && <li className="p-4 text-slate-500 font-semibold">찾는 참가자가 없습니다.</li>}
               {listed.map((r) => {
-                const st = statusOf(r, ctx);
+                const st = stOf(r);
                 return (
                   <li key={r.id}>
                     <button
@@ -276,7 +344,13 @@ export function RosterPicker({ roster, claims, records, trial, flight = 1, selec
                           <span className="block text-xs font-semibold text-slate-500 truncate">{profileLine(r)}</span>
                         )}
                       </span>
-                      <StatusChip status={st} claim={claims[r.id]} trial={trial} done={flightsDone(r, trial, doneKeys)} />
+                      <StatusChip
+                        status={st}
+                        claim={claims[r.id]}
+                        trial={trialOf(r) || trial}
+                        done={flightsDone(r, trialOf(r) || trial, doneKeys)}
+                        text={chipText(r, st)}
+                      />
                     </button>
                   </li>
                 );
@@ -351,7 +425,7 @@ export function RosterManager({ roster, claims, records, error, onSave, onClear,
           <h3 className="text-lg font-black text-slate-800">참가자 명단</h3>
           {roster.length > 0 ? (
             <span className="text-sm font-bold text-slate-500 tabular-nums">
-              {roster.length}명 · 1st({FLIGHTS_PER_TRIAL}회) 완료 {done1} · 2nd({FLIGHTS_PER_TRIAL}회) 완료 {done2} · 채점 중 {inProgress}
+              {roster.length}명 · 1라운드 완료 {done1} · 2라운드 완료 {done2} · 채점 중 {inProgress}
             </span>
           ) : (
             <span className="text-sm font-semibold text-slate-400">아직 없음 — 엑셀로 불러오세요</span>
@@ -417,8 +491,8 @@ export function RosterManager({ roster, claims, records, error, onSave, onClear,
                 <th className="py-2.5 px-3">이름</th>
                 <th className="py-2.5 px-3">부문 · 국가 · 소속 · 학년 · 성별</th>
                 <th className="py-2.5 px-3">조</th>
-                <th className="py-2.5 px-3">1st</th>
-                <th className="py-2.5 px-3">2nd</th>
+                <th className="py-2.5 px-3">1라운드</th>
+                <th className="py-2.5 px-3">2라운드</th>
               </tr>
             </thead>
             <tbody>

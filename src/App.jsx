@@ -55,7 +55,7 @@ import {
   claimedByOther,
   FLIGHTS_PER_TRIAL,
   flightOf,
-  nextFlightFor,
+  nextRoundFor,
 } from "./Roster";
 import {
   LogOut,
@@ -265,6 +265,10 @@ function buildRecord(form) {
     if (v) out[k] = v;
   });
   if (form.rosterId) out.rosterId = String(form.rosterId);
+  // 라운드 연결 정보: 같은 라운드의 1·2차 비행은 roundId·서명(signatureId)을 공유
+  if (form.roundId) out.roundId = String(form.roundId);
+  if (form.signatureId) out.signatureId = String(form.signatureId);
+  if (form.noFlight) out.noFlight = true;
   return { ...out, ...calcScores(out) };
 }
 
@@ -334,8 +338,11 @@ function localStamp() {
 }
 
 /** 정렬 기준: DQ 최하위 → 점수 내림차순 → 시간 오름차순 → 먼저 제출 */
+/** 순위 제외 기록: 실격(DQ) 또는 비행 안 함 */
+const unranked = (r) => !!r.isDQ || !!r.noFlight;
+
 function compareRecords(a, b) {
-  if (!!a.isDQ !== !!b.isDQ) return a.isDQ ? 1 : -1;
+  if (unranked(a) !== unranked(b)) return unranked(a) ? 1 : -1;
   const s = n(b.totalScore) - n(a.totalScore);
   if (s) return s;
   const t = timeToCs(a) - timeToCs(b);
@@ -370,7 +377,7 @@ function rankByCategory(records) {
     let rank = 0;
     let prev = null;
     list.forEach((r, i) => {
-      if (r.isDQ) {
+      if (unranked(r)) {
         out.push({ ...r, rank: null });
         return;
       }
@@ -496,12 +503,6 @@ function useStopwatch(onStop) {
     else storage.set(SW_KEY, JSON.stringify(sw));
   }, [sw]);
 
-  // 새로고침 직후 '정지' 상태였다면 기록 시간을 폼에 다시 채움
-  useEffect(() => {
-    if (sw.status === "stopped") onStopRef.current?.(sw.elapsed);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   // 측정 중: 화면 갱신 + 화면 꺼짐 방지
   useEffect(() => {
     if (sw.status !== "running") return undefined;
@@ -558,10 +559,10 @@ function useStopwatch(onStop) {
     setSw({ ...sw, status: "running" });
     buzz(40);
   };
-  const reset = () => { setSw({ status: "idle", startAt: 0, elapsed: 0 }); onStopRef.current?.(0); };
+  const reset = () => setSw({ status: "idle", startAt: 0, elapsed: 0 });
   const toggle = () => {
-    if (sw.status === "idle") start();
-    else if (sw.status === "running") stop();
+    if (sw.status === "running") stop();
+    else start();
   };
 
   return { status: sw.status, elapsed, start, stop, undo, reset, toggle };
@@ -577,7 +578,7 @@ export default function App() {
   const [view, setView] = useState("landing");
   const [records, setRecords] = useState([]);
   const [legacySigs, setLegacySigs] = useState({}); // 예전 방식(기록 안에 저장된) 서명
-  const [rosterState, setRosterState] = useState({ roster: [], claims: {}, error: null });
+  const [rosterState, setRosterState] = useState({ roster: [], claims: {}, error: null, loaded: false });
   const [hqAuthenticated, setHqAuthenticated] = useState(false);
   const connected = useConnection();
 
@@ -588,11 +589,11 @@ export default function App() {
       ref(db, ROSTER_PATH),
       (snap) => {
         const v = snap.val() || {};
-        setRosterState({ roster: rosterFromObject(v.roster), claims: v.claims || {}, error: null });
+        setRosterState({ roster: rosterFromObject(v.roster), claims: v.claims || {}, error: null, loaded: true });
       },
       (err) => {
         console.error("Roster sync error:", err);
-        setRosterState({ roster: [], claims: {}, error: err?.code || "error" });
+        setRosterState({ roster: [], claims: {}, error: err?.code || "error", loaded: false });
       }
     );
   }, [isLoggedIn]);
@@ -679,6 +680,7 @@ export default function App() {
           onGoToHQ={goHQ}
           roster={rosterState.roster}
           claims={rosterState.claims}
+          rosterLoaded={rosterState.loaded}
         />
       )}
       {view === "hq_auth" && (
@@ -856,123 +858,353 @@ function RoleCard({ tone, icon, title, desc, cta, onClick, locked }) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Judge
+// Judge — 라운드 단위 채점
+//  1 라운드 = 코딩 + 연속 2회 비행(3분 안). 1차 비행은 심판 신호로, 2차 비행은 참가자가 바로 시작.
+//  · 1차 STOP → 1차 기록 자동 저장(HQ에 즉시 표시) → 곧바로 2차 START 대기
+//  · 2차 STOP → 1·2차 요약을 학생이 확인하고 서명 → 확정 시 2차 기록 저장(HQ 표시)
+//  · 서명은 라운드당 1회(총 2회), 같은 라운드의 두 기록이 함께 사용
 // ─────────────────────────────────────────────────────────────
-function JudgeView({ records, connected, onGoToHQ, roster = [], claims = {} }) {
+const ROUND_KEY = "idcc_round_v2";
+const ROUND_LABEL = { "1st": "1 라운드", "2nd": "2 라운드" };
+const ROUND_OPTIONS = TRIALS.map((t) => ROUND_LABEL[t]);
+const FLOW_OPTIONS = [
+  { key: "round", label: "라운드별 진행 (전원 1R → 2R)" },
+  { key: "participant", label: "참가자별 연속 (1R → 바로 2R)" },
+];
+const FLIGHT_FIELDS = [
+  ...MISSIONS.map((m) => m.key),
+  "lndBlueCount",
+  "lndRedCount",
+  "lndYellowCount",
+  "min",
+  "sec",
+  "ms",
+  "isDQ",
+];
+
+/** 비행 1회의 입력 상태 (status: ready → running → stopped → saved) */
+const emptyFlight = () => ({
+  ...Object.fromEntries(FLIGHT_FIELDS.map((k) => [k, EMPTY_SCORES[k]])),
+  noFlight: false,
+  status: "ready",
+  recordId: null,
+  savedAt: 0,
+});
+
+/** 새 라운드 — 심판 이름·부문·라운드는 이어서 사용 */
+const freshRound = (prev = {}) => ({
+  judgeName: prev.judgeName ?? (storage.get("idrcc_judge_name") || ""),
+  category: prev.category ?? (storage.get("idrcc_category") || "Elementary"),
+  trial: prev.trial ?? "1st",
+  participantNumber: "",
+  participantName: "",
+  country: "",
+  affiliation: "",
+  grade: "",
+  gender: "",
+  rosterId: null,
+  coding: 0,
+  codingDone: false,
+  readyAck: false,
+  flights: [emptyFlight(), emptyFlight()],
+  active: 0, // 0: 1차 비행 차례, 1: 2차 비행 차례, 2: 학생 확인·서명
+});
+
+function loadRound() {
+  try {
+    const r = JSON.parse(storage.get(ROUND_KEY) || "null");
+    if (r && Array.isArray(r.flights) && r.flights.length === 2) {
+      // 새로고침 직전 측정 중이던 비행은 초시계 상태가 이어서 관리
+      return { ...freshRound(), ...r };
+    }
+  } catch {
+    /* ignore corrupt state */
+  }
+  return freshRound();
+}
+
+/** 라운드 + 비행 i → 저장용 기록 */
+const flightRecord = (round, i) =>
+  buildRecord({
+    ...round,
+    ...round.flights[i],
+    flight: i + 1,
+    rosterId: round.rosterId || undefined,
+    roundId: round.flights[0].recordId || undefined,
+  });
+
+/** 이 부문에서 쓰는 비행 단계 (순서대로) */
+const stagesFor = (category) => MISSIONS.filter((m) => missionAllowed(m.key, category));
+
+/** 통과한 단계 목록 (단계마다 개별 선택) */
+const clearedStages = (flight, category) =>
+  stagesFor(category).filter((m) => n(flight[m.key]) === MISSION_PTS);
+
+const flightTotal = (round, i) => calcScores({ ...round, ...round.flights[i] }).totalScore;
+
+function JudgeView({ records, connected, onGoToHQ, roster = [], claims = {}, rosterLoaded = false }) {
   const sigRef = useRef(null);
+  const flightRefs = [useRef(null), useRef(null)];
+  const signRef = useRef(null);
   const [toast, showToast] = useToast();
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [form, patch, setForm] = useScoreForm(() => ({
-    judgeName: storage.get("idrcc_judge_name") || "",
-    category: storage.get("idrcc_category") || "Elementary",
-    participantNumber: "",
-    participantName: "",
-    trial: "1st",
-    flight: 1,
-    ...EMPTY_SCORES,
-  }));
+  const [round, setRound] = useState(loadRound);
+  const roundRef = useRef(round);
+  roundRef.current = round;
 
-  // 심판 이름·카테고리는 기기에 기억 (새로고침해도 유지)
-  useEffect(() => storage.set("idrcc_judge_name", form.judgeName), [form.judgeName]);
-  useEffect(() => storage.set("idrcc_category", form.category), [form.category]);
+  // 라운드 진행 상태를 기기에 저장 → 새로고침·화면 이동 후에도 이어서 채점
+  useEffect(() => storage.set(ROUND_KEY, JSON.stringify(round)), [round]);
+  useEffect(() => storage.set("idrcc_judge_name", round.judgeName), [round.judgeName]);
+  useEffect(() => storage.set("idrcc_category", round.category), [round.category]);
 
-  // 경기 시작 준비 알림 (드론 추격전과 동일):
-  // 2번 Coding 점수를 누르면 바로 나타나 깜빡이고, 심판이 '확인'을 눌러야 멈춤.
-  // 확인 후에는 하단 START 버튼이 깜빡여 초시계 시작을 유도. 제출하면 처음 상태로 돌아감.
-  const [codingDone, setCodingDone] = useState(false);
-  const [readyAck, setReadyAck] = useState(false);
+  /** 라운드 공통 항목 수정 (부문이 바뀌면 그 부문에서 쓰지 않는 장애물 점수는 0) */
+  const patchRound = useCallback((p) => {
+    setRound((prev) => {
+      const next = { ...prev, ...p };
+      if (p.category && p.category !== prev.category) {
+        next.flights = prev.flights.map((f) => {
+          const g = { ...f };
+          MISSIONS.forEach((m) => {
+            if (!missionAllowed(m.key, next.category)) g[m.key] = 0;
+          });
+          return g;
+        });
+      }
+      return next;
+    });
+  }, []);
+  const patchFlight = useCallback((i, p) => {
+    setRound((prev) => ({
+      ...prev,
+      flights: prev.flights.map((f, j) => (j === i ? { ...f, ...p } : f)),
+    }));
+  }, []);
 
-  // ── 참가자 명단 연동 (드론 추격전과 동일) ─────────────────────
-  const [selectedId, setSelectedId] = useState(null);
+  // ── 진행 방식 ──────────────────────────────────────────────
+  // round: 라운드별 진행(전원 1라운드 → 전원 2라운드)
+  // participant: 참가자별 연속 진행(1라운드 확정 → 같은 참가자 2라운드 바로 시작)
+  const [flowMode, setFlowModeState] = useState(() =>
+    storage.get("idcc_flow_mode") === "participant" ? "participant" : "round"
+  );
+  const setFlowMode = (v) => {
+    setFlowModeState(v);
+    storage.set("idcc_flow_mode", v);
+  };
+  const continuous = flowMode === "participant";
+
+  // ── 참가자 명단 ───────────────────────────────────────────
   const [selecting, setSelecting] = useState(false);
   const [group, setGroupState] = useState(() => storage.get("idcc_roster_group") || "");
   const setGroup = (v) => {
     setGroupState(v);
     storage.set("idcc_roster_group", v);
   };
+  const selectedId = round.rosterId;
   const selectedEntry = roster.find((r) => r.id === selectedId) || null;
-
-  // 다른 화면으로 나가면 '채점 중' 표시 해제
   const selectedIdRef = useRef(null);
   selectedIdRef.current = selectedId;
   useEffect(() => () => releaseRosterEntry(selectedIdRef.current), []);
 
-  // 선택한 참가자의 번호·이름을 직접 고치면 명단 연결을 끊음 (명단에 없는 참가자로 취급)
+  // 선택한 참가자의 번호·이름을 직접 고치면 명단 연결을 끊음
   useEffect(() => {
     if (!selectedEntry) return;
     if (
-      String(form.participantNumber).trim() !== String(selectedEntry.bib) ||
-      String(form.participantName).trim() !== String(selectedEntry.name)
+      String(round.participantNumber).trim() !== String(selectedEntry.bib) ||
+      String(round.participantName).trim() !== String(selectedEntry.name)
     ) {
       releaseRosterEntry(selectedEntry.id);
-      setSelectedId(null);
-      patch({ country: "", affiliation: "", grade: "", gender: "" });
+      patchRound({ rosterId: null, country: "", affiliation: "", grade: "", gender: "" });
     }
-  }, [form.participantNumber, form.participantName, selectedEntry, patch]);
+  }, [round.participantNumber, round.participantName, selectedEntry, patchRound]);
 
-  // 초시계: 정지하면 랩타임 칸에 자동 입력
-  const sw = useStopwatch((ms) => patch(msToTimeFields(ms)));
-  const swRef = useRef(sw);
-  swRef.current = sw;
+  // HQ에서 명단을 비우거나 이 참가자를 명단에서 뺀 경우:
+  // 아직 비행 전이면 심판 화면도 비움, 비행 중·후면 입력은 남기고 명단 연결만 끊음
+  useEffect(() => {
+    const r = roundRef.current;
+    if (!rosterLoaded || !r.rosterId || roster.some((x) => x.id === r.rosterId)) return;
+    const started = r.flights.some((f) => f.status !== "ready") || sw.status === "running";
+    if (started) {
+      patchRound({ rosterId: null });
+      showToast("이 참가자가 HQ 명단에서 빠졌습니다. 입력 중인 라운드는 그대로 유지됩니다", "warn");
+    } else {
+      sigRef.current?.clear();
+      setRound((prev) => freshRound(prev));
+      showToast("HQ에서 명단이 바뀌어 참가자 입력을 비웠습니다", "warn");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roster, rosterLoaded, round.rosterId]);
 
-  // PC: 스페이스바로 Start/Stop (입력 칸·버튼·서명 패드 사용 중에는 동작 안 함)
+  // ── 초시계 ────────────────────────────────────────────────
+  const onTimerStop = (ms) => {
+    setRound((prev) => {
+      const i = prev.active;
+      if (i > 1) return prev;
+      return {
+        ...prev,
+        flights: prev.flights.map((f, j) => (j === i ? { ...f, ...msToTimeFields(ms), status: "stopped" } : f)),
+        active: i + 1,
+      };
+    });
+  };
+  const sw = useStopwatch(onTimerStop);
+  const running = sw.status === "running";
+
+  // 새로고침 후 초시계 상태가 없는데 '측정 중'으로 남은 비행은 START 대기로 되돌림
+  useEffect(() => {
+    const i = roundRef.current.active;
+    if (i <= 1 && roundRef.current.flights[i]?.status === "running" && sw.status !== "running")
+      patchFlight(i, { status: "ready" });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const scrollToEl = (el) => {
+    try {
+      el?.scrollIntoView({ behavior: "smooth", block: "start" });
+    } catch {
+      /* ignore */
+    }
+  };
+
+  /** START — 현재 차례의 비행 측정 시작 */
+  const startFlight = () => {
+    const r = roundRef.current;
+    if (r.active > 1 || sw.status === "running") return;
+    if (!String(r.judgeName).trim() || !String(r.participantNumber).trim() || !String(r.participantName).trim()) {
+      showToast("Judge Name · 참가번호 · 이름을 먼저 입력하세요", "error");
+      window.scrollTo({ top: 0, behavior: "smooth" });
+      return;
+    }
+    sw.start();
+    patchFlight(r.active, { status: "running", noFlight: false });
+  };
+  const stopFlight = () => sw.stop();
+
+  /** 실수로 STOP을 눌렀을 때: 같은 비행을 처음 시작 시각부터 이어서 측정 */
+  const undoStop = () => {
+    const r = roundRef.current;
+    if (sw.status !== "stopped" || r.active < 1) return;
+    const i = r.active - 1;
+    if (r.flights[i].noFlight) return;
+    sw.undo();
+    setRound((prev) => ({
+      ...prev,
+      active: i,
+      flights: prev.flights.map((f, j) => (j === i ? { ...f, status: "running" } : f)),
+    }));
+  };
+
+  // PC: 스페이스바로 START/STOP
+  const keyRef = useRef(null);
+  keyRef.current = () => (running ? stopFlight() : startFlight());
   useEffect(() => {
     const onKey = (e) => {
       if (e.code !== "Space" || e.repeat) return;
       const t = e.target;
       const tag = String(t?.tagName || "").toLowerCase();
-      if (["input", "textarea", "select", "button", "canvas"].includes(tag) || t?.isContentEditable)
-        return;
+      if (["input", "textarea", "select", "button", "canvas"].includes(tag) || t?.isContentEditable) return;
       e.preventDefault();
-      swRef.current.toggle();
+      keyRef.current();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  const calc = calcScores(form);
+  // 비행이 끝나면 다음 칸으로 화면 이동
+  const prevActive = useRef(round.active);
+  useEffect(() => {
+    if (round.active !== prevActive.current) {
+      if (round.active === 1) scrollToEl(flightRefs[1].current);
+      if (round.active === 2) scrollToEl(signRef.current);
+    }
+    prevActive.current = round.active;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [round.active]);
 
-  /** 명단에서 참가자 선택 → 번호·이름·부문 자동 입력 + 다른 심판에게 '채점 중' 표시 */
+  // ── 1차 비행 자동 저장 · 이후 수정 자동 반영 ─────────────────
+  const f1 = round.flights[0];
+  const f1Rec = useMemo(() => (f1.status === "ready" || f1.status === "running" ? null : flightRecord(round, 0)), [round, f1.status]);
+  const f1Json = f1Rec ? JSON.stringify(f1Rec) : "";
+  const syncedRef = useRef({ id: null, json: "" });
+
+  useEffect(() => {
+    if (!db || !f1Rec || f1.status !== "stopped") return;
+    // 처음 저장 (또는 Undo 후 다시 STOP)
+    const key = f1.recordId || push(ref(db, "scores")).key;
+    const savedAt = f1.savedAt || Date.now();
+    const rec = { ...f1Rec, roundId: key, timestamp: savedAt };
+    syncedRef.current = { id: key, json: JSON.stringify(flightRecord({ ...round, flights: [{ ...f1, recordId: key }, round.flights[1]] }, 0)) };
+    patchFlight(0, { status: "saved", recordId: key, savedAt });
+    const offline = connected === false;
+    withTimeout(update(ref(db), { [`scores/${key}`]: rec }))
+      .then(() => {
+        if (!offline) showToast(`1차 비행 기록 저장 · ${rec.totalScore} pts → 2차 비행 START 대기`);
+      })
+      .catch((e) => {
+        console.error("Flight 1 save failed:", e);
+        showToast(offline ? "오프라인 — 연결되면 1차 기록이 자동 업로드됩니다" : "1차 기록 저장 실패 — 연결을 확인하세요", "warn");
+      });
+    if (offline) showToast("오프라인 — 연결되면 1차 기록이 자동 업로드됩니다", "warn");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [f1.status]);
+
+  // 저장된 1차 기록을 고치면(단계·시간·코딩·참가자 정보) HQ 기록도 0.6초 뒤 자동 수정
+  useEffect(() => {
+    if (!db || f1.status !== "saved" || !f1.recordId || !f1Rec) return undefined;
+    if (syncedRef.current.id === f1.recordId && syncedRef.current.json === f1Json) return undefined;
+    const t = setTimeout(() => {
+      update(ref(db, `scores/${f1.recordId}`), { ...f1Rec, roundId: f1.recordId, editedAt: Date.now() })
+        .then(() => (syncedRef.current = { id: f1.recordId, json: f1Json }))
+        .catch((e) => console.error("Flight 1 update failed:", e));
+    }, 600);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [f1Json, f1.status, f1.recordId]);
+
+  // ── 명단에서 참가자 선택 ───────────────────────────────────
+  const roundRecordsOf = (bib, trial) =>
+    records.filter((r) => String(r.participantNumber ?? "").trim() === String(bib).trim() && r.trial === trial);
+
+  const isDirty = () => {
+    const r = roundRef.current;
+    return (
+      r.flights.some((f) => f.status !== "ready") ||
+      n(r.coding) > 0 ||
+      sw.status === "running" ||
+      (sigRef.current && !sigRef.current.isEmpty())
+    );
+  };
+
   const selectParticipant = async (entry) => {
     if (selecting) return;
-    if (!String(form.judgeName).trim()) {
-      showToast("먼저 1번 Judge Name(심판 이름)을 입력하세요", "warn");
+    const r = roundRef.current;
+    if (!String(r.judgeName).trim()) {
+      showToast("먼저 Judge Name(심판 이름)을 입력하세요", "warn");
       return;
     }
-    if (sw.status === "running") {
-      showToast("초시계 측정 중에는 참가자를 바꿀 수 없습니다. STOP을 먼저 누르세요", "error");
+    if (running) {
+      showToast("비행 측정 중에는 참가자를 바꿀 수 없습니다. STOP을 먼저 누르세요", "error");
       return;
     }
     const claim = claims[entry.id];
-    if (
-      claimedByOther(claim) &&
-      !window.confirm(`${claim.judge || "다른"} 심판이 이 참가자를 채점 중입니다.\n그래도 선택할까요?`)
-    )
+    if (claimedByOther(claim) && !window.confirm(`${claim.judge || "다른"} 심판이 이 참가자를 채점 중입니다.\n그래도 선택할까요?`))
       return;
-    // 이 시기에서 아직 하지 않은 첫 비행 (1회를 마쳤으면 2회부터)
-    const missingFlight = nextFlightFor(entry.bib, form.trial, records);
-    if (
-      missingFlight === null &&
-      !window.confirm(
-        `#${entry.bib} ${entry.name} 은(는) 이미 ${form.trial} ${FLIGHTS_PER_TRIAL}회 비행 채점을 모두 마쳤습니다.\n다시 채점할까요?`
-      )
-    )
+
+    // 참가자별 연속 진행이면 이 참가자가 아직 마치지 않은 첫 라운드부터
+    const targetTrial = continuous ? nextRoundFor(entry.bib, records)?.trial || r.trial : r.trial;
+    const prevRecs = roundRecordsOf(entry.bib, targetTrial);
+    const has1 = prevRecs.find((x) => flightOf(x) === 1);
+    const has2 = prevRecs.find((x) => flightOf(x) === 2);
+    if (has2 && !window.confirm(`#${entry.bib} ${entry.name} 은(는) 이미 ${ROUND_LABEL[targetTrial]} 기록이 확정되었습니다.\n다시 채점할까요? (새 기록이 추가됩니다)`))
       return;
-    const flightToUse = missingFlight ?? flightOf(form);
-    const dirty =
-      String(form.participantNumber).trim() ||
-      String(form.participantName).trim() ||
-      calc.totalScore > 0 ||
-      timeToCs(form) > 0 ||
-      sw.status !== "idle" ||
-      (sigRef.current && !sigRef.current.isEmpty());
-    if (dirty && !window.confirm("지금 입력 중인 내용(점수·초시계·서명)이 지워집니다. 참가자를 바꿀까요?")) return;
+    const resume = has1 && !has2; // 1차만 저장되고 끊긴 라운드 → 2차부터 이어서
+    if (isDirty() && !window.confirm("지금 입력 중인 라운드 내용(초시계·서명 포함)이 화면에서 지워집니다.\n이미 저장된 1차 기록은 HQ에 남습니다. 참가자를 바꿀까요?"))
+      return;
 
     setSelecting(true);
     let claimed = false;
     if (connected) {
       try {
-        await claimRosterEntry(entry.id, form.judgeName);
+        await claimRosterEntry(entry.id, r.judgeName);
         claimed = true;
       } catch (e) {
         console.error("Claim failed:", e);
@@ -984,128 +1216,171 @@ function JudgeView({ records, connected, onGoToHQ, roster = [], claims = {} }) {
 
     sw.reset();
     sigRef.current?.clear();
-    setCodingDone(false);
-    setReadyAck(false);
-    setSelectedId(entry.id);
-    setForm((prev) => ({
-      ...prev,
-      ...EMPTY_SCORES,
+    const base = {
+      ...freshRound(r),
+      trial: targetTrial,
       participantNumber: String(entry.bib),
       participantName: String(entry.name),
-      flight: flightToUse,
-      category: CATEGORIES.includes(entry.category) ? entry.category : prev.category,
+      category: CATEGORIES.includes(entry.category) ? entry.category : r.category,
+      rosterId: entry.id,
       ...Object.fromEntries(PROFILE_FIELDS.map((k) => [k, entry[k] || ""])),
-    }));
+    };
+    if (resume) {
+      const f = { ...emptyFlight(), status: "saved", recordId: has1.id, savedAt: n(has1.timestamp) || Date.now() };
+      FLIGHT_FIELDS.forEach((k) => (f[k] = k === "isDQ" ? !!has1[k] : n(has1[k])));
+      base.flights = [f, emptyFlight()];
+      base.coding = n(has1.coding);
+      base.codingDone = true;
+      base.readyAck = true;
+      base.active = 1;
+      syncedRef.current = { id: has1.id, json: JSON.stringify(flightRecord(base, 0)) };
+      showToast(`1차 비행 기록을 불러왔습니다 → ${ROUND_LABEL[targetTrial]} 2차 비행부터 이어서 진행`, "warn");
+    }
+    setRound(base);
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
-  const handleSubmit = async () => {
-    if (!db) return alert("Database is not connected. Check the Firebase configuration.");
-    if (sw.status === "running") {
-      alert("The timer is still running.\nTap STOP before submitting.");
-      return;
-    }
-    const rec = buildRecord(selectedId ? { ...form, rosterId: selectedId } : form);
-
-    if (!rec.judgeName || !rec.participantNumber || !rec.participantName) {
-      alert("Please fill in Judge Name, Participant No. and Participant Name.");
-      window.scrollTo({ top: 0, behavior: "smooth" });
-      return;
-    }
-    if (!sigRef.current || sigRef.current.isEmpty()) {
-      alert("Participant signature is required.");
-      return;
-    }
+  /** 입력 지우기 — 참가자·코딩·비행 입력을 모두 비움 (심판 이름·부문·라운드는 유지) */
+  const clearInputs = () => {
+    const r = roundRef.current;
+    if (running) return showToast("비행 측정 중에는 지울 수 없습니다. STOP을 먼저 누르세요", "error");
+    const saved1 = r.flights[0].recordId && r.flights[0].status === "saved";
     if (
-      !rec.isDQ &&
-      timeToCs(rec) === 0 &&
-      !window.confirm("Lap time is 0:00.00.\nSubmit without a lap time?")
-    )
-      return;
-
-    // [추가] 동일 카테고리·번호·차수 중복 경고
-    const dup = records.find(
-      (r) => participantKey(r) === participantKey(rec) && r.trial === rec.trial && flightOf(r) === rec.flight
-    );
-    if (
-      dup &&
       !window.confirm(
-        `${attemptLabel(rec)} (${rec.trial} · Flight ${rec.flight}) record already exists for No. ${rec.participantNumber} (${dup.participantName}, ${rec.category}).\n\nSubmit another record anyway?`
+        "심판 화면의 참가자·코딩·비행 입력과 서명을 모두 지울까요?" +
+          (saved1 ? "\n\n이미 자동 저장된 1차 비행 기록은 HQ에 그대로 남습니다. (지우려면 HQ에서 삭제)" : "")
       )
     )
       return;
+    if (r.rosterId) releaseRosterEntry(r.rosterId);
+    sw.reset();
+    sigRef.current?.clear();
+    syncedRef.current = { id: null, json: "" };
+    setRound((prev) => freshRound(prev));
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    showToast("입력을 지웠습니다", "warn");
+  };
 
+  /** 라운드를 처음부터 다시 (저장된 1차 기록 삭제 여부 선택) */
+  const restartRound = async () => {
+    const r = roundRef.current;
+    if (running) return showToast("측정 중에는 다시 시작할 수 없습니다. STOP을 먼저 누르세요", "error");
+    if (!window.confirm("이 라운드의 비행 입력을 처음부터 다시 할까요?\n(참가자·코딩 점수는 유지됩니다)")) return;
+    const id = r.flights[0].recordId;
+    if (id && window.confirm("HQ에 저장된 1차 비행 기록도 삭제할까요?\n[확인] 삭제 · [취소] 남겨 둠")) {
+      try {
+        await withTimeout(update(ref(db), { [`scores/${id}`]: null }));
+      } catch (e) {
+        alert("1차 기록 삭제 실패.\n" + (e?.message || e));
+      }
+    }
+    sw.reset();
+    sigRef.current?.clear();
+    setRound((prev) => ({ ...prev, flights: [emptyFlight(), emptyFlight()], active: 0 }));
+  };
+
+  /** 2차 비행을 하지 않은 경우 (시간 초과 등) */
+  const skipFlight2 = () => {
+    if (running || round.active !== 1) return;
+    if (!window.confirm("2차 비행을 하지 않은 것으로 기록하고 학생 확인·서명으로 넘어갈까요?")) return;
+    setRound((prev) => ({
+      ...prev,
+      active: 2,
+      flights: prev.flights.map((f, j) => (j === 1 ? { ...emptyFlight(), noFlight: true, status: "stopped" } : f)),
+    }));
+  };
+
+  // ── 학생 서명 · 라운드 확정 ────────────────────────────────
+  const handleSubmit = async () => {
+    if (!db) return alert("Database is not connected. Check the Firebase configuration.");
+    const r = roundRef.current;
+    if (running) return alert("비행 측정 중입니다. STOP을 먼저 누르세요.");
+    if (r.active < 2) return alert("1차·2차 비행이 모두 끝난 뒤 확정할 수 있습니다.");
+    if (!sigRef.current || sigRef.current.isEmpty()) {
+      alert("학생 서명이 필요합니다.");
+      scrollToEl(signRef.current);
+      return;
+    }
     const offline = connected === false;
     if (
       offline &&
       !window.confirm(
-        "You are OFFLINE.\n\nThe record will be kept on this device and uploaded automatically when the connection returns.\nDo NOT close or refresh this page until the status shows Online.\n\nContinue?"
+        "OFFLINE 상태입니다.\n\n기록은 이 기기에 보관되었다가 연결되면 자동 업로드됩니다.\nOnline 표시가 나올 때까지 이 화면을 닫거나 새로고침하지 마세요.\n\n계속할까요?"
       )
     )
       return;
 
     setIsSubmitting(true);
     try {
-      const key = push(ref(db, "scores")).key;
+      const key1 = r.flights[0].recordId || push(ref(db, "scores")).key;
+      const key2 = push(ref(db, "scores")).key;
+      const roundId = key1;
+      const withRound = { ...r, flights: [{ ...r.flights[0], recordId: key1 }, r.flights[1]] };
+      const rec1 = flightRecord(withRound, 0);
+      const rec2 = flightRecord(withRound, 1);
       const signature = sigRef.current.toDataURL();
-      // [수정] 점수와 서명을 분리 저장 (원자적 다중 경로 쓰기)
       const writing = update(ref(db), {
-        [`scores/${key}`]: { ...rec, hasSignature: true, timestamp: Date.now() },
-        [`signatures/${key}`]: signature,
+        [`scores/${key1}`]: {
+          ...rec1,
+          roundId,
+          signatureId: roundId,
+          hasSignature: true,
+          timestamp: r.flights[0].savedAt || Date.now(),
+        },
+        [`scores/${key2}`]: { ...rec2, roundId, signatureId: roundId, hasSignature: true, timestamp: Date.now() },
+        [`signatures/${roundId}`]: signature,
       });
-      if (offline) {
-        writing.catch((e) => console.error("Queued write failed:", e));
-        showToast("Saved offline — will sync when online", "warn");
-      } else {
-        await writing;
-      }
-      const moreFlights = rec.flight < FLIGHTS_PER_TRIAL;
-      if (!offline)
-        showToast(
-          moreFlights
-            ? `${attemptLabel(rec)} 제출 완료 · ${rec.totalScore} pts → 같은 참가자 ${rec.trial}-${rec.flight + 1} 비행 준비`
-            : `${attemptLabel(rec)} 제출 완료 · No. ${rec.participantNumber} · ${rec.totalScore} pts`
-        );
-      sigRef.current.clear();
+      if (offline) writing.catch((e) => console.error("Queued write failed:", e));
+      else await withTimeout(writing);
+
+      const best = Math.max(rec1.isDQ ? -1 : rec1.totalScore, rec2.isDQ || rec2.noFlight ? -1 : rec2.totalScore);
+      showToast(
+        offline
+          ? "오프라인 저장 — 연결되면 자동 업로드됩니다"
+          : `${ROUND_LABEL[r.trial]} 확정 · #${r.participantNumber} · 최고 ${Math.max(0, best)} pts`,
+        offline ? "warn" : "success"
+      );
+      const ri = TRIALS.indexOf(r.trial);
+      const goNextRound = continuous && ri >= 0 && ri < TRIALS.length - 1;
       sw.reset();
-      setCodingDone(false);
-      setReadyAck(false);
-      if (moreFlights) {
-        // 같은 참가자의 다음 비행: 번호·이름·부문·명단 연결은 그대로, 점수·시간·서명만 비움
-        setForm((prev) => ({ ...prev, ...EMPTY_SCORES, flight: rec.flight + 1 }));
-      } else {
-        if (selectedId) releaseRosterEntry(selectedId); // 채점 완료 → '채점 중' 표시 해제
-        setSelectedId(null);
-        setForm((prev) => ({
-          ...prev,
-          ...EMPTY_SCORES,
-          flight: 1,
-          country: "",
-          affiliation: "",
-          grade: "",
-          gender: "",
-          participantNumber: "",
-          participantName: "",
+      sigRef.current.clear();
+      syncedRef.current = { id: null, json: "" };
+      if (goNextRound) {
+        // 같은 참가자의 다음 라운드: 참가자·명단 연결·코딩 점수는 그대로, 비행·서명만 새로
+        const nextTrial = TRIALS[ri + 1];
+        setRound((prev) => ({
+          ...freshRound(prev),
+          trial: nextTrial,
+          participantNumber: prev.participantNumber,
+          participantName: prev.participantName,
+          rosterId: prev.rosterId,
+          coding: prev.coding,
+          ...Object.fromEntries(PROFILE_FIELDS.map((k) => [k, prev[k] || ""])),
         }));
+        if (!offline) showToast(`${ROUND_LABEL[r.trial]} 확정 → 같은 참가자 ${ROUND_LABEL[nextTrial]} 바로 진행 (코딩 점수 확인)`);
+      } else {
+        if (r.rosterId) releaseRosterEntry(r.rosterId);
+        // 참가자별 연속 진행이면 다음 참가자는 1라운드부터
+        setRound((prev) => ({ ...freshRound(prev), trial: continuous ? TRIALS[0] : prev.trial }));
       }
       window.scrollTo({ top: 0, behavior: "smooth" });
     } catch (e) {
       console.error(e);
-      alert("Submission failed. Check the internet connection and try again.\n\n" + (e?.message || e));
+      alert("저장 실패. 인터넷 연결을 확인하고 다시 시도하세요.\n\n" + (e?.message || e));
     } finally {
       setIsSubmitting(false);
     }
   };
 
+  const totals = [flightTotal(round, 0), flightTotal(round, 1)];
+
   return (
-    <div className="max-w-4xl mx-auto px-3 md:px-6 pt-5 md:pt-8 pb-56 md:pb-40">
+    <div className="max-w-4xl mx-auto px-3 md:px-6 pt-5 md:pt-8 pb-56 md:pb-44">
       <Toast toast={toast} />
 
       <div className="flex items-end justify-between gap-3 mb-5">
         <div>
-          <div className="text-xs font-black uppercase tracking-widest text-sky-600">
-            Judge Console
-          </div>
+          <div className="text-xs font-black uppercase tracking-widest text-sky-600">Judge Console</div>
           <h2 className="text-2xl md:text-3xl font-black tracking-tight">DCC Official Scoring</h2>
         </div>
         <button
@@ -1117,55 +1392,459 @@ function JudgeView({ records, connected, onGoToHQ, roster = [], claims = {} }) {
       </div>
 
       <div className="space-y-5">
-        {roster.length > 0 && (
+        {(roster.length > 0 || rosterLoaded) && (
           <RosterPicker
             roster={roster}
             claims={claims}
             records={records}
-            trial={form.trial}
-            flight={flightOf(form)}
+            trial={round.trial}
+            flight={Math.min(2, round.active + 1)}
             selectedId={selectedId}
             group={group}
             setGroup={setGroup}
             onSelect={selectParticipant}
             busy={selecting}
+            continuous={continuous}
           />
         )}
-        <ParticipantFields form={form} patch={patch} />
-        <ScoreFields
-          form={form}
-          patch={patch}
-          stopwatch={sw}
-          onCodingChange={() => setCodingDone(true)}
-          afterCoding={
-            codingDone && (
-              <ReadyAlert acknowledged={readyAck} onAcknowledge={() => setReadyAck(true)} />
-            )
-          }
+
+        <ParticipantFields
+          form={round}
+          patch={patchRound}
+          roundMode
+          onClear={clearInputs}
+          flowMode={flowMode}
+          onFlowMode={setFlowMode}
         />
-        <Section step={6} title="Participant Signature" icon={<PenLine size={18} />} tone="slate"
-          subtitle="Ask the participant to confirm the score and sign below.">
-          <SignatureBox ref={sigRef} height={200} />
+
+        <Section step={2} title="Coding" icon={<Code size={18} />} tone="indigo"
+          subtitle="라운드마다 1회 입력 · 이 라운드의 1·2차 비행 기록에 함께 들어갑니다"
+          right={<ScoreChip tone="indigo">{n(round.coding)} / {CODING_MAX}</ScoreChip>}>
+          <CodingInput value={round.coding} onChange={(v) => patchRound({ coding: v, codingDone: true })} />
         </Section>
-        <RecentSubmissions records={records} judgeName={form.judgeName} />
+
+        {round.codingDone && round.active === 0 && f1.status === "ready" && (
+          <ReadyAlert acknowledged={round.readyAck} onAcknowledge={() => patchRound({ readyAck: true })} />
+        )}
+
+        {[0, 1].map((i) => (
+          <div key={i} ref={flightRefs[i]} style={{ scrollMarginTop: "5.5rem" }}>
+            <FlightPanel
+              index={i}
+              round={round}
+              flight={round.flights[i]}
+              isCurrent={round.active === i}
+              locked={round.active < i}
+              running={running && round.active === i}
+              liveMs={sw.elapsed}
+              total={totals[i]}
+              onPatch={(p) => patchFlight(i, p)}
+              onSkip={i === 1 ? skipFlight2 : undefined}
+            />
+          </div>
+        ))}
+
+        <div ref={signRef} style={{ scrollMarginTop: "5.5rem" }}>
+          <RoundSignSection
+            round={round}
+            totals={totals}
+            ready={round.active === 2}
+            sigRef={sigRef}
+            onRestart={restartRound}
+          />
+        </div>
+
+        <RecentSubmissions records={records} judgeName={round.judgeName} />
       </div>
 
-      <SubmitBar
-        total={calc.totalScore}
-        form={form}
+      <FlightBar
+        round={round}
+        sw={sw}
+        totals={totals}
         isSubmitting={isSubmitting}
+        onStart={startFlight}
+        onStop={stopFlight}
+        onUndo={undoStop}
         onSubmit={handleSubmit}
-        label="Finalize & Submit"
-        stopwatch={sw}
-        highlightStart={readyAck && sw.status === "idle"}
       />
     </div>
   );
 }
 
-function ParticipantFields({ form, patch, showJudge = true }) {
+/** 비행 1회 입력 칸 — 단계 버튼은 '마지막으로 통과한 단계'를 누르면 앞 단계까지 자동 포함 */
+function FlightPanel({ index, round, flight, isCurrent, locked, running, liveMs, total, onPatch, onSkip }) {
+  const stages = stagesFor(round.category);
+  const cleared = clearedStages(flight, round.category);
+  const used = landingCount(flight);
+  const calc = calcScores({ ...round, ...flight });
+  const landingPts = calc.lndBlueScore + calc.lndRedScore + calc.lndYellowScore;
+  const editable = !locked && !flight.noFlight;
+
+  /** 단계 하나만 켜고 끔 (다른 단계에는 영향 없음) */
+  const toggleStage = (key) => onPatch({ [key]: n(flight[key]) === MISSION_PTS ? 0 : MISSION_PTS });
+
+  const statusChip = flight.noFlight
+    ? ["bg-slate-200 text-slate-600", "비행 안 함"]
+    : flight.status === "running"
+    ? ["bg-rose-500 text-white animate-pulse", "측정 중"]
+    : flight.status === "saved"
+    ? ["bg-emerald-100 text-emerald-800", "자동 저장됨 · HQ 표시"]
+    : flight.status === "stopped"
+    ? ["bg-amber-100 text-amber-900", index === 0 ? "저장 중…" : "종료 · 서명 대기"]
+    : isCurrent
+    ? ["bg-sky-100 text-sky-800", "START 대기"]
+    : ["bg-slate-100 text-slate-500", "대기"];
+
   return (
-    <Section step={1} title="Participant" icon={<Users size={18} />} tone="sky">
+    <section
+      className={`rounded-3xl border-2 shadow-sm p-4 md:p-6 transition ${
+        running
+          ? "bg-rose-50/60 border-rose-400 shadow-rose-100"
+          : isCurrent && !locked
+          ? "bg-white border-sky-300"
+          : "bg-white border-slate-200/80"
+      } ${locked ? "opacity-50" : ""}`}
+    >
+      <div className="flex flex-wrap items-center gap-3 mb-4">
+        <div
+          className={`w-11 h-11 rounded-2xl grid place-items-center font-black text-white text-lg shrink-0 ${
+            index === 0 ? "bg-emerald-500" : "bg-teal-500"
+          }`}
+        >
+          {index + 1}차
+        </div>
+        <div className="min-w-0 flex-1">
+          <h3 className="font-black text-xl leading-tight">
+            {ROUND_LABEL[round.trial]} · {index + 1}차 비행
+          </h3>
+          <p className="text-sm text-slate-500 font-semibold">
+            {index === 0 ? "심판 신호로 시작합니다" : "참가자가 신호 없이 바로 시작합니다 — 출발하면 바로 START"}
+          </p>
+        </div>
+        <span className={`px-3 py-1.5 rounded-xl text-sm font-black whitespace-nowrap ${statusChip[0]}`}>{statusChip[1]}</span>
+        <ScoreChip tone="emerald">{flight.noFlight || flight.status === "ready" ? "—" : `${total} pts`}</ScoreChip>
+      </div>
+
+      {locked ? (
+        <p className="text-base font-bold text-slate-500 py-3">1차 비행이 끝나면 활성화됩니다.</p>
+      ) : flight.noFlight ? (
+        <div className="flex flex-wrap items-center gap-3 py-2">
+          <p className="text-base font-bold text-slate-600">2차 비행을 하지 않은 것으로 기록됩니다.</p>
+          <button
+            type="button"
+            onClick={() => onPatch({ noFlight: false, status: "ready" })}
+            className="h-10 px-3 rounded-xl border-2 border-slate-200 text-sm font-bold text-slate-600 hover:border-slate-300"
+          >
+            취소
+          </button>
+        </div>
+      ) : (
+        <>
+          {/* 비행 단계 */}
+          <div className="flex items-baseline justify-between gap-2 mb-2">
+            <FieldLabel>비행 임무 — 성공한 단계를 각각 누르세요 (다시 누르면 취소)</FieldLabel>
+            <span className="text-sm font-black text-emerald-700 whitespace-nowrap">
+              {cleared.length}개 성공 · {cleared.length * MISSION_PTS}점
+            </span>
+          </div>
+          <div className={`grid gap-2 ${stages.length > 4 ? "grid-cols-3 sm:grid-cols-6" : "grid-cols-2 sm:grid-cols-4"}`}>
+            {stages.map((m, i) => {
+              const on = n(flight[m.key]) === MISSION_PTS;
+              return (
+                <button
+                  key={m.key}
+                  type="button"
+                  disabled={!editable}
+                  onClick={() => toggleStage(m.key)}
+                  aria-pressed={on}
+                  className={`relative min-h-[78px] rounded-2xl border-2 px-2 py-2 text-left transition active:scale-[0.97] ${
+                    on
+                      ? "bg-emerald-500 border-emerald-500 text-white"
+                      : "bg-white border-slate-200 text-slate-700 hover:border-emerald-300"
+                  }`}
+                >
+                  <span className={`block text-xs font-black ${on ? "text-emerald-100" : "text-slate-400"}`}>
+                    {i + 1}단계 · +{MISSION_PTS}
+                  </span>
+                  <span className="block font-black leading-tight mt-1">{m.label}</span>
+                  {on && <Check size={18} strokeWidth={3} className="absolute top-2 right-2" />}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* 착륙 */}
+          <div className="mt-4 flex items-center justify-between gap-2">
+            <FieldLabel>Landing Zones (최대 {MAX_LANDINGS}회)</FieldLabel>
+            <span className="text-sm font-black text-amber-700">{landingPts}점</span>
+          </div>
+          <div className="grid grid-cols-3 gap-2">
+            {LANDING_ZONES.map((z) => {
+              const c = n(flight[z.key]);
+              return (
+                <div key={z.key} className={`rounded-2xl ${z.soft} ring-1 ${z.ring} p-2 flex items-center justify-between gap-1`}>
+                  <button
+                    type="button"
+                    disabled={!editable || c <= 0}
+                    onClick={() => onPatch({ [z.key]: c - 1 })}
+                    className="w-11 h-11 rounded-xl bg-white border-2 border-slate-200 grid place-items-center disabled:opacity-30"
+                    aria-label={`Remove ${z.name}`}
+                  >
+                    <Minus size={18} />
+                  </button>
+                  <div className="text-center leading-tight">
+                    <div className={`text-xs font-black ${z.text}`}>
+                      {z.name} {z.pts}
+                    </div>
+                    <div className="text-2xl font-black tabular-nums">{c}</div>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={!editable || used >= MAX_LANDINGS}
+                    onClick={() => onPatch({ [z.key]: c + 1 })}
+                    className="w-11 h-11 rounded-xl bg-white border-2 border-slate-200 grid place-items-center disabled:opacity-30"
+                    aria-label={`Add ${z.name}`}
+                  >
+                    <Plus size={18} />
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* 시간 · DQ */}
+          <div className="mt-4 flex flex-col md:flex-row md:items-end gap-4">
+            {running ? (
+              <div>
+                <FieldLabel>Lap Time</FieldLabel>
+                <div className="h-16 px-4 rounded-2xl bg-rose-500 text-white font-mono text-3xl font-black tabular-nums grid place-items-center">
+                  {formatMs(liveMs)}
+                </div>
+              </div>
+            ) : (
+              <TimeInput form={flight} patch={onPatch} />
+            )}
+            <DQToggle on={!!flight.isDQ} onToggle={() => onPatch({ isDQ: !flight.isDQ })} />
+            {onSkip && isCurrent && !running && (
+              <button
+                type="button"
+                onClick={onSkip}
+                className="md:mb-5 h-16 px-4 rounded-2xl border-2 border-slate-200 bg-white text-slate-600 font-bold hover:border-slate-300"
+              >
+                2차 비행 안 함
+              </button>
+            )}
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
+/** 라운드 요약(1·2차) + 학생 서명 */
+function RoundSignSection({ round, totals, ready, sigRef, onRestart }) {
+  const rows = round.flights.map((f, i) => {
+    const c = clearedStages(f, round.category);
+    const notFlown = f.noFlight || f.status === "ready";
+    return {
+      i,
+      f,
+      stage: f.noFlight
+        ? "비행 안 함"
+        : f.status === "ready"
+        ? "아직 비행 전"
+        : c.length
+        ? `${c.length}개 · ${c.map((m) => m.label).join(", ")}`
+        : "—",
+      landing: notFlown ? "—" : `${landingCount(f)}회`,
+      time: notFlown ? "—" : formatTime(f),
+      total: notFlown ? null : totals[i],
+    };
+  });
+  const valid = rows.filter((r) => r.total !== null && !r.f.isDQ);
+  const best = valid.length
+    ? valid.reduce((a, b) => (b.total > a.total || (b.total === a.total && timeToCs(b.f) < timeToCs(a.f)) ? b : a))
+    : null;
+
+  return (
+    <section className={`rounded-3xl border-2 p-4 md:p-6 shadow-sm ${ready ? "bg-white border-violet-300" : "bg-white border-slate-200/80"}`}>
+      <div className="flex flex-wrap items-center gap-3 mb-4">
+        <div className="w-11 h-11 rounded-2xl bg-violet-500 text-white grid place-items-center shrink-0">
+          <PenLine size={20} />
+        </div>
+        <div className="flex-1 min-w-0">
+          <h3 className="font-black text-xl leading-tight">{ROUND_LABEL[round.trial]} 기록 확인 · 학생 서명</h3>
+          <p className="text-sm text-slate-500 font-semibold">
+            2차 비행이 끝나면 학생이 1·2차 기록을 확인하고 서명합니다. 확정하면 2차 기록이 HQ에 올라갑니다.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={onRestart}
+          className="h-10 px-3 rounded-xl border-2 border-slate-200 text-sm font-bold text-slate-500 hover:text-rose-600 hover:border-rose-200 flex items-center gap-1.5"
+        >
+          <RotateCcw size={15} /> 라운드 다시
+        </button>
+      </div>
+
+      <div className="overflow-x-auto rounded-2xl border border-slate-200">
+        <table className="w-full min-w-[520px] text-left">
+          <thead className="bg-slate-50 text-xs font-black uppercase tracking-wider text-slate-500">
+            <tr>
+              <th className="p-3">비행</th>
+              <th className="p-3">성공 단계</th>
+              <th className="p-3 text-center">착륙</th>
+              <th className="p-3 text-center">시간</th>
+              <th className="p-3 text-center">총점</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => {
+              const isBest = best && best.i === r.i;
+              return (
+                <tr key={r.i} className={`border-t border-slate-100 ${isBest ? "bg-amber-50" : ""}`}>
+                  <td className="p-3 font-black whitespace-nowrap">
+                    {r.i + 1}차 {isBest && <span className="ml-1 text-amber-600">★ 최고</span>}
+                  </td>
+                  <td className="p-3 font-bold">{r.stage}</td>
+                  <td className="p-3 text-center font-bold tabular-nums">{r.landing}</td>
+                  <td className="p-3 text-center font-mono font-bold">{r.time}</td>
+                  <td className="p-3 text-center">
+                    {r.f.isDQ ? (
+                      <span className="px-2 py-1 rounded-lg bg-rose-100 text-rose-700 text-sm font-black">DQ</span>
+                    ) : (
+                      <span className="text-2xl font-black text-blue-600 tabular-nums">{r.total ?? "—"}</span>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      <div className={`mt-4 ${ready ? "" : "pointer-events-none opacity-40"}`}>
+        <FieldLabel>학생 서명 {ready ? "" : "— 2차 비행이 끝나면 서명할 수 있습니다"}</FieldLabel>
+        <SignatureBox ref={sigRef} height={190} />
+      </div>
+    </section>
+  );
+}
+
+/** 하단 고정 바 — 현재 비행의 START/STOP을 크게, 서명 단계에서는 확정 버튼 */
+function FlightBar({ round, sw, totals, isSubmitting, onStart, onStop, onUndo, onSubmit }) {
+  const running = sw.status === "running";
+  const active = round.active;
+  const label = active <= 1 ? `${active + 1}차 비행` : "서명 · 확정";
+  const armed = !running && active <= 1 && (active === 1 || round.readyAck);
+  const canUndo = !running && sw.status === "stopped" && active >= 1 && !round.flights[active - 1]?.noFlight;
+  const shownTime = running
+    ? formatMs(sw.elapsed)
+    : active <= 1
+    ? formatTime(round.flights[active])
+    : formatTime(round.flights[1].noFlight ? round.flights[0] : round.flights[1]);
+  const bestTotal = Math.max(
+    ...round.flights.map((f, i) => (f.status === "ready" || f.noFlight || f.isDQ ? 0 : totals[i]))
+  );
+
+  return (
+    <div
+      className="fixed bottom-0 inset-x-0 z-40 bg-white/95 backdrop-blur border-t border-slate-200 shadow-[0_-10px_30px_-15px_rgba(15,23,42,0.3)]"
+      style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
+    >
+      <div className="max-w-4xl mx-auto px-3 md:px-6 py-2.5 md:py-3 flex flex-col md:flex-row md:items-center gap-2.5 md:gap-4">
+        <div className="flex items-center gap-2 md:gap-3 flex-1 min-w-0">
+          <div
+            className={`h-16 px-3 md:px-4 rounded-2xl ring-1 flex items-center gap-2.5 min-w-[10rem] ${
+              running ? "bg-rose-50 ring-rose-200" : "bg-slate-50 ring-slate-200"
+            }`}
+          >
+            <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${running ? "bg-rose-500 animate-pulse" : "bg-slate-300"}`} />
+            <div className="leading-none">
+              <div className="text-[11px] font-black uppercase tracking-widest text-slate-500 mb-1">
+                {ROUND_LABEL[round.trial]} · {label}
+              </div>
+              <div className={`font-mono text-2xl md:text-3xl font-black tabular-nums ${running ? "text-rose-600" : "text-slate-700"}`}>
+                {shownTime}
+              </div>
+            </div>
+          </div>
+
+          {running ? (
+            <button
+              type="button"
+              onClick={onStop}
+              className="flex-1 h-16 px-4 rounded-2xl bg-rose-600 hover:bg-rose-700 text-white text-xl md:text-2xl font-black flex items-center justify-center gap-2 shadow-lg shadow-rose-300 active:scale-95"
+            >
+              <Square size={22} fill="currentColor" /> {active + 1}차 STOP
+            </button>
+          ) : active <= 1 ? (
+            <button
+              type="button"
+              onClick={onStart}
+              className={`flex-1 h-16 px-4 rounded-2xl bg-emerald-500 hover:bg-emerald-600 text-white text-xl md:text-2xl font-black flex items-center justify-center gap-2 shadow-lg shadow-emerald-200 active:scale-95 ${
+                armed ? "animate-blink ring-4 ring-red-500 ring-offset-2" : ""
+              }`}
+            >
+              <Play size={22} fill="currentColor" /> {active + 1}차 START
+            </button>
+          ) : null}
+
+          {canUndo && (
+            <button
+              type="button"
+              onClick={onUndo}
+              title="STOP을 잘못 눌렀다면, 처음 시작 시각부터 이어서 측정합니다"
+              className="h-16 px-3 rounded-2xl bg-white border-2 border-slate-200 text-slate-600 text-sm font-bold flex flex-col items-center justify-center leading-tight"
+            >
+              <Undo2 size={18} /> {active}차 계속
+            </button>
+          )}
+        </div>
+
+        {active === 2 && (
+          <div className="flex items-center gap-3">
+            <div className="shrink-0">
+              <div className="text-[11px] font-black uppercase tracking-widest text-slate-400">라운드 최고</div>
+              <div className="text-3xl font-black text-blue-600 tabular-nums leading-none">
+                {bestTotal}
+                <span className="text-sm text-slate-400 ml-1">pts</span>
+              </div>
+            </div>
+            <button
+              onClick={onSubmit}
+              disabled={isSubmitting}
+              className="flex-1 md:min-w-[240px] h-16 px-4 rounded-2xl text-white text-lg font-black flex items-center justify-center gap-2 shadow-lg transition active:scale-[0.98] bg-gradient-to-r from-violet-500 to-blue-500 hover:from-violet-600 hover:to-blue-600 shadow-violet-200 disabled:from-slate-300 disabled:to-slate-300"
+            >
+              {isSubmitting ? <Loader2 size={22} className="animate-spin" /> : <CheckCircle2 size={22} />}
+              서명 완료 · 라운드 확정
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ParticipantFields({ form, patch, showJudge = true, roundMode = false, onClear, flowMode, onFlowMode }) {
+  return (
+    <Section
+      step={1}
+      title="Participant"
+      icon={<Users size={18} />}
+      tone="sky"
+      right={
+        onClear && (
+          <button
+            type="button"
+            onClick={onClear}
+            className="shrink-0 h-10 px-3 rounded-xl border-2 border-rose-200 text-rose-600 text-sm font-bold flex items-center gap-1.5 hover:bg-rose-50"
+          >
+            <Trash2 size={15} /> 입력 지우기
+          </button>
+        )
+      }
+    >
       <div className="grid md:grid-cols-2 gap-4">
         {showJudge && (
           <TextField
@@ -1199,15 +1878,45 @@ function ParticipantFields({ form, patch, showJudge = true }) {
             cols="grid-cols-2 sm:grid-cols-4"
           />
         </div>
-        <div>
-          <FieldLabel>Trial · Flight (각 시기 {FLIGHTS_PER_TRIAL}회 비행)</FieldLabel>
-          <Segmented
-            options={ATTEMPTS}
-            value={attemptLabel(form)}
-            onChange={(v) => patch(parseAttempt(v))}
-            cols="grid-cols-4"
-          />
-        </div>
+        {roundMode ? (
+          <>
+            {onFlowMode && (
+              <div>
+                <FieldLabel>진행 방식</FieldLabel>
+                <Segmented
+                  options={FLOW_OPTIONS.map((o) => o.label)}
+                  value={(FLOW_OPTIONS.find((o) => o.key === flowMode) || FLOW_OPTIONS[0]).label}
+                  onChange={(v) => onFlowMode(FLOW_OPTIONS.find((o) => o.label === v)?.key || "round")}
+                  cols="grid-cols-1 sm:grid-cols-2"
+                />
+                <p className="mt-1.5 ml-1 text-xs font-semibold text-slate-500">
+                  {flowMode === "participant"
+                    ? "1라운드를 확정하면 같은 참가자의 2라운드로 바로 넘어갑니다. 2라운드까지 끝나면 다음 참가자."
+                    : "전원이 1라운드를 마친 뒤 2라운드를 진행합니다. 확정하면 다음 참가자로 넘어갑니다."}
+                </p>
+              </div>
+            )}
+            <div>
+              <FieldLabel>Round (라운드마다 {FLIGHTS_PER_TRIAL}회 비행)</FieldLabel>
+              <Segmented
+                options={ROUND_OPTIONS}
+                value={ROUND_LABEL[form.trial]}
+                onChange={(v) => patch({ trial: TRIALS[ROUND_OPTIONS.indexOf(v)] || "1st" })}
+                cols="grid-cols-2"
+              />
+            </div>
+          </>
+        ) : (
+          <div>
+            <FieldLabel>Round · Flight</FieldLabel>
+            <Segmented
+              options={ATTEMPTS}
+              value={attemptLabel(form)}
+              onChange={(v) => patch(parseAttempt(v))}
+              cols="grid-cols-4"
+            />
+          </div>
+        )}
       </div>
     </Section>
   );
@@ -1348,147 +2057,6 @@ function TimerStatusChip({ status }) {
   );
 }
 
-/** 하단 고정 바의 초시계 — 어느 위치로 스크롤해도 바로 누를 수 있음 */
-function StopwatchControl({ sw, recorded, highlightStart = false }) {
-  const running = sw.status === "running";
-  const stopped = sw.status === "stopped";
-  const box = running
-    ? "bg-rose-50 ring-rose-200"
-    : stopped
-    ? "bg-emerald-50 ring-emerald-200"
-    : "bg-slate-50 ring-slate-200";
-  const txt = running ? "text-rose-600" : stopped ? "text-emerald-700" : "text-slate-700";
-  const dot = running ? "bg-rose-500 animate-pulse" : stopped ? "bg-emerald-500" : "bg-slate-300";
-  const btnBase =
-    "h-14 md:h-16 rounded-2xl font-black flex items-center justify-center gap-2 transition active:scale-95";
-
-  return (
-    <div className="flex items-center gap-2 md:gap-3">
-      <div
-        className={`h-14 md:h-16 px-3 md:px-4 rounded-2xl ring-1 flex items-center gap-2.5 min-w-[9.5rem] md:min-w-[11rem] ${box}`}
-        aria-live="off"
-      >
-        <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${dot}`} />
-        <div className="leading-none">
-          <div className="text-[10px] font-black uppercase tracking-widest text-slate-400 mb-1">
-            {running ? "Timing" : stopped ? "Recorded" : "Lap time"}
-          </div>
-          <div className={`font-mono text-2xl md:text-3xl font-black tabular-nums ${txt}`}>
-            {running ? formatMs(sw.elapsed) : recorded}
-          </div>
-        </div>
-      </div>
-
-      {running && (
-        <button
-          type="button"
-          onClick={sw.stop}
-          className={`${btnBase} flex-1 md:flex-none md:w-36 px-5 bg-rose-500 hover:bg-rose-600 text-white text-lg shadow-lg shadow-rose-200`}
-        >
-          <Square size={20} fill="currentColor" /> STOP
-        </button>
-      )}
-      {sw.status === "idle" && (
-        <button
-          type="button"
-          onClick={sw.start}
-          className={`${btnBase} flex-1 md:flex-none md:w-36 px-5 bg-emerald-500 hover:bg-emerald-600 text-white text-lg shadow-lg shadow-emerald-200 ${
-            highlightStart ? "animate-blink ring-4 ring-red-500 ring-offset-2" : ""
-          }`}
-        >
-          <Play size={20} fill="currentColor" /> START
-        </button>
-      )}
-      {stopped && (
-        <>
-          <button
-            type="button"
-            onClick={sw.undo}
-            title="Stopped by mistake? Continue timing from the original start."
-            className={`${btnBase} flex-1 md:flex-none px-3 bg-white border-2 border-slate-200 text-slate-600 text-sm hover:border-slate-300`}
-          >
-            <Undo2 size={18} /> Undo
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              if (window.confirm("Reset the timer and lap time to 0:00.00?"))
-                sw.reset();
-            }}
-            className={`${btnBase} flex-1 md:flex-none px-3 bg-white border-2 border-slate-200 text-slate-600 text-sm hover:border-slate-300`}
-          >
-            <RotateCcw size={18} /> Reset
-          </button>
-        </>
-      )}
-    </div>
-  );
-}
-
-function SubmitBar({ total, form, isSubmitting, onSubmit, label, stopwatch, highlightStart = false }) {
-  const timerRunning = stopwatch?.status === "running";
-  const blocked = isSubmitting || timerRunning;
-  return (
-    <div
-      className="fixed bottom-0 inset-x-0 z-40 bg-white/95 backdrop-blur border-t border-slate-200 shadow-[0_-10px_30px_-15px_rgba(15,23,42,0.3)]"
-      style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
-    >
-      <div className="max-w-4xl mx-auto px-3 md:px-6 py-2.5 md:py-3 flex flex-col md:flex-row md:items-center gap-2.5 md:gap-4">
-        {stopwatch && (
-          <StopwatchControl sw={stopwatch} recorded={formatTime(form)} highlightStart={highlightStart} />
-        )}
-        <div className="flex items-center gap-3 md:gap-4 flex-1 min-w-0">
-        <div className="shrink-0">
-          <div className="text-[11px] font-black uppercase tracking-widest text-slate-400">
-            Total
-          </div>
-          <div className="text-4xl font-black text-blue-600 tabular-nums leading-none">
-            {total}
-            <span className="text-base text-slate-400 ml-1 font-bold">pts</span>
-          </div>
-        </div>
-        {!stopwatch && (
-          <div className="hidden sm:flex flex-col text-sm font-bold text-slate-500 gap-0.5">
-            <span className="flex items-center gap-1.5">
-              <Clock size={14} /> {formatTime(form)}
-            </span>
-            <span>Landings {landingCount(form)}/{MAX_LANDINGS}</span>
-          </div>
-        )}
-        {form.isDQ && (
-          <span className="px-2.5 py-1 rounded-lg bg-rose-100 text-rose-700 text-sm font-black">
-            DQ
-          </span>
-        )}
-        <button
-          onClick={onSubmit}
-          disabled={blocked}
-          className={`ml-auto flex-1 md:flex-none md:min-w-[220px] h-14 md:h-16 px-3 rounded-2xl text-white text-base sm:text-lg md:text-xl font-black flex items-center justify-center gap-2 shadow-lg transition active:scale-[0.98] ${
-            blocked
-              ? "bg-slate-300 cursor-not-allowed shadow-none"
-              : "bg-gradient-to-r from-blue-500 to-sky-500 hover:from-blue-600 hover:to-sky-600 shadow-sky-200"
-          }`}
-        >
-          {isSubmitting ? (
-            <>
-              <Loader2 size={22} className="animate-spin" /> Submitting…
-            </>
-          ) : timerRunning ? (
-            <>
-              <Timer size={22} /> Stop timer first
-            </>
-          ) : (
-            <>
-              <CheckCircle2 size={24} /> {label}
-            </>
-          )}
-        </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 function RecentSubmissions({ records, judgeName }) {
   const name = String(judgeName || "").trim();
   const mine = useMemo(
@@ -1544,7 +2112,9 @@ function HQView({ records, legacySigs = {}, rosterState, onGoToJudge, onLock }) 
       (err) => console.error("Signature sync error:", err)
     );
   }, []);
-  const sigOf = (id) => sigMap[id] || legacySigs[id] || null;
+  /** 기록의 서명 — 같은 라운드의 1·2차 기록은 서명 1개(signatureId)를 함께 사용 */
+  const sigKeyOf = (r) => r.signatureId || r.id;
+  const sigOf = (r) => sigMap[sigKeyOf(r)] || legacySigs[r.id] || null;
 
   /** 기록 1건 삭제 (서명 포함) */
   const handleDelete = async (r) => {
@@ -1555,14 +2125,19 @@ function HQView({ records, legacySigs = {}, rosterState, onGoToJudge, onLock }) 
     )
       return;
     try {
-      await withTimeout(update(ref(db), { [`scores/${r.id}`]: null, [`signatures/${r.id}`]: null }));
+      // 서명은 같은 라운드의 다른 기록이 쓰지 않을 때만 함께 삭제
+      const k = sigKeyOf(r);
+      const shared = records.some((x) => x.id !== r.id && sigKeyOf(x) === k);
+      const upd = { [`scores/${r.id}`]: null };
+      if (!shared) upd[`signatures/${k}`] = null;
+      await withTimeout(update(ref(db), upd));
       showToast("Record deleted", "warn");
     } catch (e) {
       alert("Delete failed.\n" + (e?.message || e));
     }
   };
   const [catFilter, setCatFilter] = useState("All");
-  const [mode, setMode] = useState("all"); // all | best
+  const [mode, setMode] = useState("best"); // best: 참가자별 4회 중 최고 기록 | all: 비행 기록 전체
   const [sortBy, setSortBy] = useState("rank");
   const [query, setQuery] = useState("");
   const [toast, showToast] = useToast();
@@ -1609,8 +2184,8 @@ function HQView({ records, legacySigs = {}, rosterState, onGoToJudge, onLock }) 
 
   const editingRecord = records.find((r) => r.id === editingId);
 
-  const toExcelRow = (r) => ({
-    Rank: r.rank ?? "DQ",
+  /** 비행 1회 기록 → 엑셀 한 줄 */
+  const toFlightRow = (r) => ({
     Category: r.category,
     "No.": r.participantNumber,
     Participant: r.participantName,
@@ -1618,9 +2193,9 @@ function HQView({ records, legacySigs = {}, rosterState, onGoToJudge, onLock }) 
     Affiliation: r.affiliation || "",
     Grade: r.grade || "",
     Gender: r.gender || "",
-    Trial: r.trial,
+    Round: ROUND_LABEL[r.trial] || r.trial,
     Flight: flightOf(r),
-    "Trial-Flight": attemptLabel(r),
+    "Round-Flight": attemptLabel(r),
     Coding: n(r.coding),
     Takeoff: n(r.takeoff),
     "Obstacle A": n(r.obsA),
@@ -1632,28 +2207,64 @@ function HQView({ records, legacySigs = {}, rosterState, onGoToJudge, onLock }) 
     "Red (count)": n(r.lndRedCount),
     "Yellow (count)": n(r.lndYellowCount),
     "Landing Pts": n(r.lndBlueScore) + n(r.lndRedScore) + n(r.lndYellowScore),
-    Total: n(r.totalScore),
-    Time: formatTime(r),
+    Total: r.noFlight ? "" : n(r.totalScore),
+    Time: r.noFlight ? "" : formatTime(r),
     DQ: r.isDQ ? "YES" : "NO",
+    "No Flight": r.noFlight ? "YES" : "",
     Judge: r.judgeName,
-    Signature: sigOf(r.id) ? "Y" : "N",
+    Signature: sigOf(r) ? "Y" : "N",
     Submitted: r.timestamp ? new Date(r.timestamp).toLocaleString() : "",
     Edited: r.editedAt ? new Date(r.editedAt).toLocaleString() : "",
   });
 
   const downloadExcel = () => {
-    if (!ranked.length) return alert("There are no records to export.");
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(ranked.map(toExcelRow)), "All");
-    CATEGORIES.forEach((cat) => {
-      const rows = ranked.filter((r) => r.category === cat);
-      if (rows.length)
-        XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows.map(toExcelRow)), cat);
+    if (!records.length) return alert("There are no records to export.");
+    // 참가자별 4회 기록 (같은 비행이 여러 번 저장된 경우 가장 최근 것)
+    const byPerson = new Map();
+    records.forEach((r) => {
+      const k = participantKey(r);
+      const m = byPerson.get(k) || {};
+      const a = attemptLabel(r);
+      if (!m[a] || n(r.timestamp) > n(m[a].timestamp)) m[a] = r;
+      byPerson.set(k, m);
     });
-    XLSX.writeFile(
-      wb,
-      `IDCC_DCC_Results_${mode === "best" ? "BestFlight" : "AllFlights"}_${localStamp()}.xlsx`
+    const cell = (r) => (!r ? "" : r.noFlight ? "No flight" : r.isDQ ? "DQ" : n(r.totalScore));
+
+    const finalRanked = rankByCategory(bestPerParticipant(records));
+    const finalRows = finalRanked.map((b) => {
+      const m = byPerson.get(participantKey(b)) || {};
+      return {
+        Rank: b.rank ?? (b.noFlight ? "-" : "DQ"),
+        Category: b.category,
+        "No.": b.participantNumber,
+        Participant: b.participantName,
+        Country: b.country || "",
+        Affiliation: b.affiliation || "",
+        ...Object.fromEntries(ATTEMPTS.map((a) => [`${a} Total`, cell(m[a])])),
+        ...Object.fromEntries(ATTEMPTS.map((a) => [`${a} Time`, m[a] && !m[a].noFlight ? formatTime(m[a]) : ""])),
+        "Final (Best)": b.noFlight ? "" : n(b.totalScore),
+        "Best Time": b.noFlight ? "" : formatTime(b),
+        "Best Flight": attemptLabel(b),
+        "Flights Recorded": Object.keys(m).length,
+      };
+    });
+
+    const allFlights = [...records].sort(
+      (a, b) =>
+        CATEGORIES.indexOf(a.category) - CATEGORIES.indexOf(b.category) ||
+        String(a.participantNumber).localeCompare(String(b.participantNumber), undefined, { numeric: true }) ||
+        ATTEMPTS.indexOf(attemptLabel(a)) - ATTEMPTS.indexOf(attemptLabel(b)) ||
+        n(a.timestamp) - n(b.timestamp)
     );
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(finalRows), "Final (Best of 4)");
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(allFlights.map(toFlightRow)), "All Flights");
+    CATEGORIES.forEach((cat) => {
+      const rows = finalRows.filter((r) => r.Category === cat);
+      if (rows.length) XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows), cat);
+    });
+    XLSX.writeFile(wb, `IDCC_DCC_Results_${localStamp()}.xlsx`);
   };
 
   const handleResetAll = async () => {
@@ -1749,8 +2360,8 @@ function HQView({ records, legacySigs = {}, rosterState, onGoToJudge, onLock }) 
         <div className="flex flex-col md:flex-row gap-3 md:items-center">
           <div className="flex p-1 bg-slate-100 rounded-2xl w-full md:w-auto">
             {[
-              ["all", "All flights"],
-              ["best", "Best flight only"],
+              ["best", "최종 순위 (4회 중 최고)"],
+              ["all", "전체 비행 기록"],
             ].map(([k, lbl]) => (
               <button
                 key={k}
@@ -1830,7 +2441,7 @@ function HQView({ records, legacySigs = {}, rosterState, onGoToJudge, onLock }) 
                       }`}
                     >
                       <td className="p-3 text-center">
-                        <RankBadge rank={r.rank} />
+                        <RankBadge rank={r.rank} noFlight={!!r.noFlight && !r.isDQ} />
                       </td>
                       <td className="p-3">
                         <CategoryBadge category={r.category} />
@@ -1857,7 +2468,9 @@ function HQView({ records, legacySigs = {}, rosterState, onGoToJudge, onLock }) 
                           {n(r.totalScore)}
                         </span>
                       </td>
-                      <td className="p-3 text-center font-mono font-bold text-slate-600">{formatTime(r)}</td>
+                      <td className="p-3 text-center font-mono font-bold text-slate-600">
+                        {r.noFlight ? <span className="font-sans text-xs font-black text-slate-400">No flight</span> : formatTime(r)}
+                      </td>
                       <td className="p-3 text-sm text-slate-500 font-semibold">
                         {r.judgeName}
                         {r.editedAt && (
@@ -1867,14 +2480,14 @@ function HQView({ records, legacySigs = {}, rosterState, onGoToJudge, onLock }) 
                         )}
                       </td>
                       <td className="p-3 text-center">
-                        {sigOf(r.id) ? (
+                        {sigOf(r) ? (
                           <button
                             onClick={() => setViewSig(r)}
                             className="inline-block w-28 h-12 rounded-xl border-2 border-slate-200 bg-white hover:border-sky-400 overflow-hidden align-middle"
                             title="서명 크게 보기"
                             aria-label={`${r.participantName} 서명 크게 보기`}
                           >
-                            <img src={sigOf(r.id)} alt="" className="w-full h-full object-contain" />
+                            <img src={sigOf(r)} alt="" className="w-full h-full object-contain" />
                           </button>
                         ) : (
                           <span className="text-sm font-bold text-slate-300">없음</span>
@@ -1909,7 +2522,7 @@ function HQView({ records, legacySigs = {}, rosterState, onGoToJudge, onLock }) 
         </div>
       </div>
 
-      {viewSig && <SignatureViewer record={viewSig} src={sigOf(viewSig.id)} onClose={() => setViewSig(null)} />}
+      {viewSig && <SignatureViewer record={viewSig} src={sigOf(viewSig)} onClose={() => setViewSig(null)} />}
 
       {editingRecord && (
         <EditModal
@@ -1986,7 +2599,7 @@ function EditModal({ record, onClose, showToast }) {
     let alive = true;
     (async () => {
       try {
-        let s = (await get(ref(db, `signatures/${record.id}`))).val();
+        let s = (await get(ref(db, `signatures/${record.signatureId || record.id}`))).val();
         if (!s) s = (await get(ref(db, `scores/${record.id}/signature`))).val();
         if (alive) {
           setSigUrl(s || null);
@@ -2034,7 +2647,7 @@ function EditModal({ record, onClose, showToast }) {
           editedAt: Date.now(),
         },
       };
-      if (changed || sigState === "ok") updates[`signatures/${record.id}`] = signature;
+      if (changed || sigState === "ok") updates[`signatures/${record.signatureId || record.id}`] = signature;
       await update(ref(db), updates);
       showToast("Record updated");
       onClose();
@@ -2049,7 +2662,15 @@ function EditModal({ record, onClose, showToast }) {
     if (!window.confirm(`Delete the record of No. ${record.participantNumber} (${record.participantName})?\nThis cannot be undone.`))
       return;
     try {
-      await update(ref(db), { [`scores/${record.id}`]: null, [`signatures/${record.id}`]: null });
+      // 같은 라운드의 다른 기록이 함께 쓰는 서명은 남김
+      const upd = { [`scores/${record.id}`]: null };
+      if (!record.signatureId || record.signatureId === record.id) {
+        const others = (await get(ref(db, "scores"))).val() || {};
+        const k = record.signatureId || record.id;
+        const shared = Object.entries(others).some(([id, v]) => id !== record.id && (v?.signatureId || id) === k);
+        if (!shared) upd[`signatures/${k}`] = null;
+      }
+      await update(ref(db), upd);
       showToast("Record deleted", "warn");
       onClose();
     } catch (e) {
@@ -2649,11 +3270,15 @@ function CategoryBadge({ category, full }) {
   );
 }
 
-function RankBadge({ rank }) {
+function RankBadge({ rank, noFlight = false }) {
   if (rank == null)
     return (
-      <span className="inline-grid place-items-center h-9 px-2.5 rounded-xl bg-rose-100 text-rose-600 text-sm font-black">
-        DQ
+      <span
+        className={`inline-grid place-items-center h-9 px-2.5 rounded-xl text-sm font-black ${
+          noFlight ? "bg-slate-100 text-slate-500" : "bg-rose-100 text-rose-600"
+        }`}
+      >
+        {noFlight ? "—" : "DQ"}
       </span>
     );
   const style =
