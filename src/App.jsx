@@ -121,8 +121,8 @@ try {
 // ─────────────────────────────────────────────────────────────
 // Competition constants
 // ─────────────────────────────────────────────────────────────
-const JUDGE_PASSWORD = "idrcc2026";
-const HQ_PASSWORD = "admin2026";
+const JUDGE_PASSWORD = "cho0725";
+const HQ_PASSWORD = "cho0725";
 
 const CATEGORIES = ["Elementary", "Middle School", "High School", "General"];
 const CATEGORY_SHORT = {
